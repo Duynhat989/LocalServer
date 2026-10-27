@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/
+views/assets/
+views/index.html
+*.log
+.DS_Store

@@ -1,0 +1,41 @@
+{
+  "name": "localserver",
+  "version": "1.0.0",
+  "description": "Electron LocalServer with Express HTTP on port 6868",
+  "main": "main.js",
+  "scripts": {
+    "build:web": "vite build --config client/vite.config.js",
+    "dev:web": "vite --config client/vite.config.js",
+    "prestart": "npm run build:web",
+    "start": "electron .",
+    "dev": "electron .",
+    "rebuild": "electron-rebuild -f -w sqlite3",
+    "postinstall": "electron-rebuild -f -w sqlite3 || true"
+  },
+  "keywords": [
+    "electron",
+    "express",
+    "localserver",
+    "vue"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@lucide/vue": "^1.61.0",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
+    "@vue-flow/minimap": "^1.5.4",
+    "express": "^4.21.2",
+    "sequelize": "^6.37.8",
+    "sqlite3": "^5.1.7",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^34.2.0",
+    "vite": "^6.0.7"
+  }
+}

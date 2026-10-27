@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LocalServer — Báo cáo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="atmosphere" aria-hidden="true"></div>
+
+    <main class="app fade-in">
+      <header class="topbar">
+        <div class="brand">
+          <img class="logo" src="logo.png" alt="LocalServer" width="32" height="32" />
+          <div>
+            <span class="brand-name">LocalServer</span>
+            <p class="brand-sub">Bảng báo cáo dịch vụ</p>
+          </div>
+        </div>
+        <span id="badge" class="badge badge--off">Đang kiểm tra…</span>
+      </header>
+
+      <section class="hero">
+        <p class="eyebrow">Máy chủ local</p>
+        <h1 id="heroTitle" class="display">Đang kiểm tra kích hoạt</h1>
+        <p id="heroLead" class="lead">
+          Đang xác minh trạng thái kích hoạt…
+        </p>
+        <div class="hero-actions">
+          <button id="checkLicense" class="btn-secondary" type="button">Kiểm tra lại</button>
+          <button id="openWeb" class="btn-primary" type="button" disabled>
+            Mở trang web
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+              <path
+                d="M5 12h14M13 6l6 6-6 6"
+                stroke="currentColor"
+                stroke-width="2.2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </section>
+
+      <section id="waitingPanel" class="panel waiting-panel" aria-live="polite">
+        <div class="panel-head">
+          <h2>Đang chờ kích hoạt</h2>
+        </div>
+        <p class="waiting-copy">
+          Ứng dụng chưa được kích hoạt. Vui lòng liên hệ quản trị viên để được cấp quyền sử dụng,
+          rồi bấm <strong>Kiểm tra lại</strong>.
+        </p>
+        <p id="waitingDetail" class="waiting-detail muted">—</p>
+      </section>
+
+      <div id="activePanel" hidden>
+        <section class="stats">
+          <div class="stat slide-up">
+            <span class="stat-label">Users</span>
+            <strong id="userCount">0</strong>
+          </div>
+          <div class="stat slide-up delay-1">
+            <span class="stat-label">Admin</span>
+            <strong id="adminCount">0</strong>
+          </div>
+        </section>
+
+        <section class="panel status" aria-live="polite">
+          <div class="panel-head">
+            <h2>Trạng thái server</h2>
+          </div>
+          <div class="row">
+            <span class="label">Port</span>
+            <span id="port" class="value">6868</span>
+          </div>
+          <div class="row">
+            <span class="label">URL web</span>
+            <span id="urlText" class="value value--link">—</span>
+          </div>
+          <div class="row">
+            <span class="label">Bắt đầu</span>
+            <span id="startedAt" class="value">—</span>
+          </div>
+          <div class="row">
+            <span class="label">Kiểm tra lại sau</span>
+            <span id="recheckCountdown" class="value mono">—</span>
+          </div>
+        </section>
+      </div>
+
+      <p id="error" class="error" hidden></p>
+
+    </main>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
