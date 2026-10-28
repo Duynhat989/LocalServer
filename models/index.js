@@ -14,6 +14,7 @@ const { defineActivityLog } = require('./ActivityLog');
 const { hashPassword } = require('../utils/password');
 const { buildPostKeyword } = require('../utils/text');
 const { getDataDir } = require('../utils/dataDir');
+const { ensurePostKeywordIndex } = require('../utils/postKeywordIndex');
 
 function getDbPath() {
   return path.join(getDataDir(), 'localserver.db');
@@ -284,6 +285,7 @@ async function initDatabase({ force } = {}) {
   await safeSync({ force: shouldForce });
   await seedAdmin(User);
   await seedSamplePost(Post);
+  await ensurePostKeywordIndex(sequelize);
   await backfillPostKeywords(Post);
 
   if (shouldForce) {

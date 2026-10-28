@@ -53,23 +53,36 @@ function parsePaths(raw) {
   }
 }
 
-function escapeGlob(value) {
-  return String(value).replace(/[[*?]/g, (ch) => `[${ch}]`);
+function ftsPhrase(needle) {
+  return `"${String(needle).replace(/"/g, '""')}"`;
 }
 
-function keywordFieldMatch(needle) {
-  // keyword giữ dấu câu và xuống dòng. Ký tự đó là ranh giới, không bị đổi thành dấu cách.
+function keywordPathsWhere(paths) {
   const { sequelize } = getModels();
-  const token = escapeGlob(needle);
-  const patterns = [
-    token,
-    `${token}[^a-z0-9]*`,
-    `*[^a-z0-9]${token}`,
-    `*[^a-z0-9]${token}[^a-z0-9]*`,
-  ].map((pattern) => sequelize.escape(pattern));
-  return literal(
-    `(keyword GLOB ${patterns[0]} OR keyword GLOB ${patterns[1]} OR keyword GLOB ${patterns[2]} OR keyword GLOB ${patterns[3]})`
-  );
+  const groups = [];
+
+  for (const path of paths) {
+    const phrases = [];
+    const scans = [];
+    for (const needle of path) {
+      if (!needle) continue;
+      if (needle.length >= 3) phrases.push(ftsPhrase(needle));
+      else scans.push(`instr(keyword, ${sequelize.escape(needle)}) > 0`);
+    }
+
+    const and = [];
+    if (phrases.length) {
+      const match = phrases.length === 1 ? phrases[0] : `(${phrases.join(' AND ')})`;
+      and.push(
+        `id IN (SELECT rowid FROM post_keyword_fts WHERE post_keyword_fts MATCH ${sequelize.escape(match)})`
+      );
+    }
+    and.push(...scans);
+    if (and.length) groups.push(and.length === 1 ? and[0] : `(${and.join(' AND ')})`);
+  }
+
+  if (!groups.length) return null;
+  return literal(groups.join(' OR '));
 }
 
 function parseDateOnly(value) {
@@ -149,19 +162,8 @@ function buildListWhere(query = {}) {
 
   const paths = parsePaths(query.paths);
   if (paths.length) {
-    const pathClauses = paths
-      .map((path) => {
-        const parts = path.map((needle) => keywordFieldMatch(needle));
-        if (!parts.length) return null;
-        return { [Op.and]: parts };
-      })
-      .filter(Boolean);
-
-    if (pathClauses.length === 1) {
-      and.push(pathClauses[0]);
-    } else if (pathClauses.length > 1) {
-      and.push({ [Op.or]: pathClauses });
-    }
+    const keywordWhere = keywordPathsWhere(paths);
+    if (keywordWhere) and.push(keywordWhere);
   }
 
   if (!and.length) return {};
