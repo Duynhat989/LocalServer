@@ -1,5 +1,8 @@
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
+
+app.setName('LocalServer');
+
 const { createServer, PORT } = require('./server');
 const { getLocalWebUrl } = require('./utils/network');
 const { checkLicense } = require('./utils/license');

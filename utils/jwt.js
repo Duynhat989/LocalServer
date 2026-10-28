@@ -2,15 +2,20 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const SECRET_PATH = path.join(__dirname, '..', 'data', '.jwt_secret');
+const { getDataDir } = require('./dataDir');
+
+function secretPath() {
+  return path.join(getDataDir(), '.jwt_secret');
+}
 
 let cachedSecret = null;
 
 function getJwtSecret() {
   if (cachedSecret) return cachedSecret;
   try {
-    if (fs.existsSync(SECRET_PATH)) {
-      const raw = fs.readFileSync(SECRET_PATH, 'utf8').trim();
+    const file = secretPath();
+    if (fs.existsSync(file)) {
+      const raw = fs.readFileSync(file, 'utf8').trim();
       if (raw) {
         cachedSecret = raw;
         return cachedSecret;
@@ -20,10 +25,11 @@ function getJwtSecret() {
     /* ignore */
   }
 
-  const dir = path.dirname(SECRET_PATH);
+  const file = secretPath();
+  const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   cachedSecret = crypto.randomBytes(48).toString('hex');
-  fs.writeFileSync(SECRET_PATH, cachedSecret, { mode: 0o600 });
+  fs.writeFileSync(file, cachedSecret, { mode: 0o600 });
   return cachedSecret;
 }
 

@@ -10,7 +10,11 @@
     "start": "electron .",
     "dev": "electron .",
     "rebuild": "electron-rebuild -f -w sqlite3",
-    "postinstall": "electron-rebuild -f -w sqlite3 || true"
+    "postinstall": "electron-rebuild -f -w sqlite3 || true",
+    "sqlite:binaries": "node scripts/fetch-sqlite-binaries.js",
+    "dist:mac": "npm run build:web && npm run sqlite:binaries && electron-builder --config electron-builder.config.js --mac dmg --arm64",
+    "dist:win": "npm run build:web && npm run sqlite:binaries && electron-builder --config electron-builder.config.js --win portable --x64",
+    "dist": "npm run build:web && npm run sqlite:binaries && electron-builder --config electron-builder.config.js --mac dmg --arm64 && electron-builder --config electron-builder.config.js --win portable --x64"
   },
   "keywords": [
     "electron",
@@ -36,6 +40,7 @@
     "@electron/rebuild": "^4.2.1",
     "@vitejs/plugin-vue": "^5.2.1",
     "electron": "^34.2.0",
+    "electron-builder": "^26.0.12",
     "vite": "^6.0.7"
   }
 }

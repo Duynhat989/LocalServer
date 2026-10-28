@@ -13,9 +13,11 @@ const { defineApiKey } = require('./ApiKey');
 const { defineActivityLog } = require('./ActivityLog');
 const { hashPassword } = require('../utils/password');
 const { buildPostKeyword } = require('../utils/text');
+const { getDataDir } = require('../utils/dataDir');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const DB_PATH = path.join(DATA_DIR, 'localserver.db');
+function getDbPath() {
+  return path.join(getDataDir(), 'localserver.db');
+}
 
 let sequelize = null;
 let User = null;
@@ -30,13 +32,14 @@ let ApiKey = null;
 let ActivityLog = null;
 
 function createSequelize() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dataDir = getDataDir();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
   }
 
   return new Sequelize({
     dialect: 'sqlite',
-    storage: DB_PATH,
+    storage: getDbPath(),
     logging: false,
     define: {
       underscored: false,
@@ -122,8 +125,9 @@ async function seedSamplePost(PostModel) {
 }
 
 function removeOldDbFiles() {
+  const dataDir = getDataDir();
   for (const file of ['localserver.db', 'localserver.db-shm', 'localserver.db-wal']) {
-    const full = path.join(DATA_DIR, file);
+    const full = path.join(dataDir, file);
     if (fs.existsSync(full)) fs.unlinkSync(full);
   }
 }
@@ -240,11 +244,12 @@ async function backfillPostKeywords(PostModel) {
 }
 
 async function initDatabase({ force } = {}) {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dataDir = getDataDir();
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
   }
 
-  const markerPath = path.join(DATA_DIR, '.sequelize');
+  const markerPath = path.join(dataDir, '.sequelize');
   const shouldForce = typeof force === 'boolean' ? force : !fs.existsSync(markerPath);
 
   if (shouldForce) {
@@ -283,7 +288,7 @@ async function initDatabase({ force } = {}) {
 
   if (shouldForce) {
     fs.writeFileSync(markerPath, new Date().toISOString());
-    console.log('Sequelize tables recreated:', DB_PATH);
+    console.log('Sequelize tables recreated:', getDbPath());
   }
 
   return {
@@ -340,5 +345,7 @@ function getModels() {
 module.exports = {
   initDatabase,
   getModels,
-  DB_PATH,
+  get DB_PATH() {
+    return getDbPath();
+  },
 };

@@ -374,7 +374,7 @@ onMounted(async () => {
           </div>
         </label>
         <label class="field">
-          <span>Mốc dừng (bài cũ hơn)</span>
+          <span>Mốc dừng (10 bài liên tiếp cũ hơn)</span>
           <input v-model="scanSettings.scanCutoffDate" type="date" />
         </label>
         <label class="field">
