@@ -35,6 +35,8 @@ const detailLoading = ref(false);
 const detailTab = ref('phones');
 const phoneSearch = ref('');
 const phoneUsedFilter = ref('all');
+const phoneAddedOn = ref('');
+const phoneAddedDates = ref([]);
 const phonePage = ref(1);
 const PHONE_LIMIT_PRESETS = [100, 200, 500, 1000];
 const phonePageSize = ref(100);
@@ -61,6 +63,12 @@ const EXPORT_PAGE_SIZE = 200;
 
 function statusLabel(value) {
   return STATUS_OPTIONS.find((s) => s.value === value)?.label || value || '—';
+}
+
+function formatDayOption(value) {
+  const [year, month, day] = String(value || '').split('-');
+  if (!year || !month || !day) return value || '—';
+  return `${day}/${month}/${year}`;
 }
 
 function formatDate(value) {
@@ -117,6 +125,7 @@ function buildPhonesQuery(overrides = {}) {
   params.set('used', phoneUsedFilter.value || 'all');
   const q = String(phoneSearch.value || '').trim();
   if (q) params.set('q', q);
+  if (phoneAddedOn.value) params.set('addedOn', phoneAddedOn.value);
   return params.toString();
 }
 
@@ -448,6 +457,10 @@ async function loadCampaignPhones() {
     if (seq !== phonesLoadSeq) return;
     phoneRows.value = data.phones || [];
     phoneTotal.value = Number(data.total) || 0;
+    phoneAddedDates.value = Array.isArray(data.addedDates) ? data.addedDates : [];
+    if (phoneAddedOn.value && !phoneAddedDates.value.includes(phoneAddedOn.value)) {
+      phoneAddedOn.value = '';
+    }
     if (data.campaign) {
       detail.value = {
         ...detail.value,
@@ -528,6 +541,9 @@ async function openDetailModal(campaign) {
   actionError.value = '';
   phoneSearch.value = '';
   phoneUsedFilter.value = 'all';
+  detailLoading.value = true;
+  phoneAddedOn.value = '';
+  phoneAddedDates.value = [];
   phonePage.value = 1;
   phoneRows.value = [];
   phoneTotal.value = 0;
@@ -535,7 +551,6 @@ async function openDetailModal(campaign) {
   stepBatches.value = [];
   detailTab.value = 'phones';
   showDetailModal.value = true;
-  detailLoading.value = true;
   detail.value = { id: campaign.id, name: campaign.name, status: campaign.status };
   try {
     const data = await api(`/api/campaigns/${campaign.id}`, { token: token.value });
@@ -564,6 +579,8 @@ function closeDetailModal() {
   detail.value = null;
   phoneSearch.value = '';
   phoneUsedFilter.value = 'all';
+  phoneAddedOn.value = '';
+  phoneAddedDates.value = [];
   phonePage.value = 1;
   phoneRows.value = [];
   phoneTotal.value = 0;
@@ -580,6 +597,12 @@ watch(phoneSearch, () => {
 });
 
 watch(phoneUsedFilter, () => {
+  phonePage.value = 1;
+  loadCampaignPhones();
+});
+
+watch(phoneAddedOn, () => {
+  if (!showDetailModal.value || !detail.value?.id || detailLoading.value) return;
   phonePage.value = 1;
   loadCampaignPhones();
 });
@@ -913,6 +936,17 @@ onMounted(async () => {
                 <option value="all">Tất cả</option>
                 <option value="unused">Chưa dùng</option>
                 <option value="used">Đã dùng</option>
+              </select>
+              <select
+                v-model="phoneAddedOn"
+                class="limit-select-inline"
+                aria-label="Lọc theo ngày thêm"
+                :disabled="exportBusy || !phoneAddedDates.length"
+              >
+                <option value="">Tất cả ngày</option>
+                <option v-for="day in phoneAddedDates" :key="day" :value="day">
+                  {{ formatDayOption(day) }}
+                </option>
               </select>
               <label class="limit-select">
                 <span>Limit</span>

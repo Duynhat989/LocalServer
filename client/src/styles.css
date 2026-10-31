@@ -2469,6 +2469,18 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   max-width: 280px;
 }
 
+.campaign-added-dates {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+}
+
+.campaign-added-dates .pf-dates .pf-field__control {
+  height: 36px;
+  max-width: 132px;
+}
+
 .campaign-phone-toolbar .search-box input,
 .campaign-phone-toolbar .limit-select-inline {
   height: 36px;

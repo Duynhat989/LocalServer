@@ -1,4 +1,4 @@
-const { Op } = require('sequelize');
+const { Op, col, literal } = require('sequelize');
 const { getModels } = require('../models');
 const { recordActivity } = require('../utils/activityLog');
 const {
@@ -35,6 +35,45 @@ async function getCampaignCounts(CampaignPhone, campaignId) {
   return { phoneCount, unusedCount };
 }
 
+function parseDateOnly(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  return raw;
+}
+
+function dayStart(dateOnly) {
+  const date = new Date(`${dateOnly}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function dayEnd(dateOnly) {
+  const date = new Date(`${dateOnly}T23:59:59.999`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function localDateKey(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+async function listAddedDates(CampaignPhone, campaignId) {
+  const rows = await CampaignPhone.findAll({
+    where: { campaignId },
+    attributes: [[col('created_at'), 'createdAt']],
+    raw: true,
+  });
+  const days = new Set();
+  for (const row of rows) {
+    const key = localDateKey(row.createdAt);
+    if (key) days.add(key);
+  }
+  return Array.from(days).sort((a, b) => b.localeCompare(a));
+}
+
 function buildCampaignPhoneWhere(campaignId, query = {}) {
   const where = { campaignId };
   const used = String(query.used || query.isUsed || 'all').trim().toLowerCase();
@@ -42,6 +81,19 @@ function buildCampaignPhoneWhere(campaignId, query = {}) {
     where.isUsed = false;
   } else if (used === 'used' || used === '1' || used === 'true') {
     where.isUsed = true;
+  }
+
+  const addedOn = parseDateOnly(query.addedOn);
+  const addedFrom = addedOn || parseDateOnly(query.addedFrom || query.from);
+  const addedTo = addedOn || parseDateOnly(query.addedTo || query.to);
+  if (addedFrom || addedTo) {
+    const { sequelize } = getModels();
+    const createdRange = [];
+    const from = addedFrom ? dayStart(addedFrom) : null;
+    const to = addedTo ? dayEnd(addedTo) : null;
+    if (from) createdRange.push(literal(`created_at >= ${sequelize.escape(from)}`));
+    if (to) createdRange.push(literal(`created_at <= ${sequelize.escape(to)}`));
+    if (createdRange.length) where[Op.and] = createdRange;
   }
 
   const q = String(query.q || query.search || '').trim();
@@ -123,7 +175,10 @@ async function listCampaignPhones(req, res, next) {
       limit,
       offset,
     });
-    const { phoneCount, unusedCount } = await getCampaignCounts(CampaignPhone, campaignId);
+    const [{ phoneCount, unusedCount }, addedDates] = await Promise.all([
+      getCampaignCounts(CampaignPhone, campaignId),
+      listAddedDates(CampaignPhone, campaignId),
+    ]);
 
     res.json({
       ok: true,
@@ -134,9 +189,11 @@ async function listCampaignPhones(req, res, next) {
       page: Math.floor(offset / limit) + 1,
       totalPages: Math.max(1, Math.ceil(count / limit) || 1),
       campaign: toPublicCampaign(campaign, phoneCount, unusedCount),
+      addedDates,
       filters: {
         q: String(req.query.q || req.query.search || '').trim() || null,
         used: String(req.query.used || req.query.isUsed || 'all').trim().toLowerCase() || 'all',
+        addedOn: parseDateOnly(req.query.addedOn),
       },
     });
   } catch (err) {
