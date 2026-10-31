@@ -175,15 +175,19 @@ async function listCampaignPhones(req, res, next) {
       limit,
       offset,
     });
-    const [{ phoneCount, unusedCount }, addedDates] = await Promise.all([
+    const [{ phoneCount, unusedCount }, addedDates, filteredUnused] = await Promise.all([
       getCampaignCounts(CampaignPhone, campaignId),
       listAddedDates(CampaignPhone, campaignId),
+      CampaignPhone.count({
+        where: buildCampaignPhoneWhere(campaignId, { ...req.query, used: 'unused' }),
+      }),
     ]);
 
     res.json({
       ok: true,
       phones: rows.map(toPublicCampaignPhone),
       total: count,
+      filteredUnused,
       limit,
       offset,
       page: Math.floor(offset / limit) + 1,

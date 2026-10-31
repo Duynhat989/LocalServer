@@ -221,29 +221,6 @@ async function safeSync({ force }) {
   }
 }
 
-async function backfillPostKeywords(PostModel) {
-  const rows = await PostModel.findAll({
-    attributes: ['id', 'postMessage', 'keyword'],
-  });
-  const updates = [];
-  for (const row of rows) {
-    const next = buildPostKeyword({ postMessage: row.postMessage });
-    if (row.keyword !== next) updates.push({ id: row.id, keyword: next });
-  }
-  if (!updates.length) return;
-
-  const db = PostModel.sequelize;
-  await db.transaction(async (transaction) => {
-    for (const item of updates) {
-      await PostModel.update(
-        { keyword: item.keyword },
-        { where: { id: item.id }, transaction }
-      );
-    }
-  });
-  console.log(`Updated post keywords from message only: ${updates.length}`);
-}
-
 async function initDatabase({ force } = {}) {
   const dataDir = getDataDir();
   if (!fs.existsSync(dataDir)) {
@@ -286,7 +263,6 @@ async function initDatabase({ force } = {}) {
   await seedAdmin(User);
   await seedSamplePost(Post);
   await ensurePostKeywordIndex(sequelize);
-  await backfillPostKeywords(Post);
 
   if (shouldForce) {
     fs.writeFileSync(markerPath, new Date().toISOString());

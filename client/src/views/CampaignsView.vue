@@ -43,6 +43,7 @@ const phonePageSize = ref(100);
 const phoneLimitChoice = ref('100');
 const customPhoneLimit = ref(100);
 const phoneTotal = ref(0);
+const phoneFilteredUnused = ref(0);
 const phoneRows = ref([]);
 const selectedPhoneIds = ref([]);
 const selectedPhoneById = ref({});
@@ -89,6 +90,14 @@ const unusedPhoneCount = computed(() =>
   typeof detail.value?.unusedCount === 'number'
     ? detail.value.unusedCount
     : 0
+);
+
+const listedPhoneCount = computed(() =>
+  phoneAddedOn.value ? phoneTotal.value : detail.value?.phoneCount || phoneTotal.value || 0
+);
+
+const listedUnusedCount = computed(() =>
+  phoneAddedOn.value ? phoneFilteredUnused.value : unusedPhoneCount.value
 );
 
 const selectedPhoneCount = computed(() => selectedPhoneIds.value.length);
@@ -457,6 +466,7 @@ async function loadCampaignPhones() {
     if (seq !== phonesLoadSeq) return;
     phoneRows.value = data.phones || [];
     phoneTotal.value = Number(data.total) || 0;
+    phoneFilteredUnused.value = Number(data.filteredUnused) || 0;
     phoneAddedDates.value = Array.isArray(data.addedDates) ? data.addedDates : [];
     if (phoneAddedOn.value && !phoneAddedDates.value.includes(phoneAddedOn.value)) {
       phoneAddedOn.value = '';
@@ -483,6 +493,7 @@ async function loadCampaignPhones() {
     actionError.value = err.message || 'Không tải được danh sách SĐT';
     phoneRows.value = [];
     phoneTotal.value = 0;
+    phoneFilteredUnused.value = 0;
   } finally {
     if (seq === phonesLoadSeq) phonesLoading.value = false;
   }
@@ -547,6 +558,7 @@ async function openDetailModal(campaign) {
   phonePage.value = 1;
   phoneRows.value = [];
   phoneTotal.value = 0;
+  phoneFilteredUnused.value = 0;
   clearPhoneSelection();
   stepBatches.value = [];
   detailTab.value = 'phones';
@@ -584,6 +596,7 @@ function closeDetailModal() {
   phonePage.value = 1;
   phoneRows.value = [];
   phoneTotal.value = 0;
+  phoneFilteredUnused.value = 0;
   clearPhoneSelection();
   stepBatches.value = [];
 }
@@ -874,8 +887,8 @@ onMounted(async () => {
               {{ detail?.name || 'Chi tiết chiến dịch' }}
             </h3>
             <p>
-              {{ detail?.phones?.length || 0 }} SĐT
-              · {{ unusedPhoneCount }} chưa dùng
+              {{ listedPhoneCount }} SĐT
+              · {{ listedUnusedCount }} chưa dùng
               <span v-if="detail">
                 · {{ statusLabel(detail.status) }}
               </span>
@@ -901,7 +914,7 @@ onMounted(async () => {
               :class="{ active: detailTab === 'phones' }"
               @click="detailTab = 'phones'"
             >
-              Danh sách SĐT ({{ detail.phoneCount || phoneTotal || 0 }})
+              Danh sách SĐT ({{ listedPhoneCount }})
             </button>
             <button
               type="button"

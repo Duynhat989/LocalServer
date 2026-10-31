@@ -27,8 +27,7 @@ const groupFilter = ref(String(route.query.groupId || '').trim());
 const groups = ref([]);
 const phoneFilter = ref('');
 const phoneFilterApplied = ref('');
-const pushedFrom = ref('');
-const pushedTo = ref('');
+const pushedOn = ref('');
 const selectedPostIds = ref([]);
 const selectedPhones = ref([]);
 const showKeywordFlow = ref(false);
@@ -277,8 +276,7 @@ const hasActiveFilters = computed(
   () =>
     Boolean(phoneFilterApplied.value.trim()) ||
     Boolean(groupFilter.value.trim()) ||
-    Boolean(pushedFrom.value) ||
-    Boolean(pushedTo.value) ||
+    Boolean(pushedOn.value) ||
     keywordPaths.value.length > 0 ||
     hasCampaignFilter.value
 );
@@ -327,8 +325,10 @@ function buildQuery() {
   const groupId = String(groupFilter.value || '').trim();
   if (groupId) params.set('groupId', groupId);
 
-  if (pushedFrom.value) params.set('pushedFrom', pushedFrom.value);
-  if (pushedTo.value) params.set('pushedTo', pushedTo.value);
+  if (pushedOn.value) {
+    params.set('pushedFrom', pushedOn.value);
+    params.set('pushedTo', pushedOn.value);
+  }
 
   if (keywordPaths.value.length) {
     params.set('paths', JSON.stringify(keywordPaths.value));
@@ -433,8 +433,7 @@ function clearFilters() {
   phoneFilter.value = '';
   phoneFilterApplied.value = '';
   groupFilter.value = '';
-  pushedFrom.value = '';
-  pushedTo.value = '';
+  pushedOn.value = '';
   keywordPaths.value = [];
   keywordExpression.value = '';
   activeFilterName.value = '';
@@ -742,7 +741,7 @@ watch(pageLimit, () => {
   reloadFromFirstPage();
 });
 
-watch([pushedFrom, pushedTo], () => {
+watch(pushedOn, () => {
   reloadFromFirstPage();
 });
 
@@ -794,8 +793,10 @@ function buildPostLinksQuery() {
 
   const groupId = String(groupFilter.value || '').trim();
   if (groupId) params.set('groupId', groupId);
-  if (pushedFrom.value) params.set('pushedFrom', pushedFrom.value);
-  if (pushedTo.value) params.set('pushedTo', pushedTo.value);
+  if (pushedOn.value) {
+    params.set('pushedFrom', pushedOn.value);
+    params.set('pushedTo', pushedOn.value);
+  }
   if (keywordPaths.value.length) {
     params.set('paths', JSON.stringify(keywordPaths.value));
   }
@@ -1022,24 +1023,15 @@ onMounted(() => {
           </select>
         </label>
 
-        <div class="pf-field pf-field--span">
+        <label class="pf-field">
           <span class="pf-field__label">Quét</span>
-          <div class="pf-dates">
-            <input
-              v-model="pushedFrom"
-              class="pf-field__control"
-              type="date"
-              aria-label="Quét từ ngày"
-            />
-            <span class="pf-dates__sep" aria-hidden="true">→</span>
-            <input
-              v-model="pushedTo"
-              class="pf-field__control"
-              type="date"
-              aria-label="Quét đến ngày"
-            />
-          </div>
-        </div>
+          <input
+            v-model="pushedOn"
+            class="pf-field__control"
+            type="date"
+            aria-label="Ngày quét"
+          />
+        </label>
       </div>
 
       <div v-if="hasActiveFilters" class="posts-filter-chips">
@@ -1062,15 +1054,12 @@ onMounted(() => {
           <span aria-hidden="true">×</span>
         </button>
         <button
-          v-if="pushedFrom || pushedTo"
+          v-if="pushedOn"
           class="filter-chip"
           type="button"
-          @click="pushedFrom = ''; pushedTo = ''"
+          @click="pushedOn = ''"
         >
-          Quét:
-          {{ pushedFrom || '…' }}
-          →
-          {{ pushedTo || '…' }}
+          Quét: {{ pushedOn.split('-').reverse().join('/') }}
           <span aria-hidden="true">×</span>
         </button>
         <button
