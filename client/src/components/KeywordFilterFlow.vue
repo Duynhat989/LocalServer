@@ -56,7 +56,7 @@ const selectedNode = computed(() => nodes.value.find((n) => n.id === selectedNod
 function bumpKeywordSeq() {
   let max = 0;
   for (const n of nodes.value) {
-    const m = /^kw-(\d+)$/.exec(n.id);
+    const m = /^(?:kw|ex)-(\d+)$/.exec(n.id);
     if (m) max = Math.max(max, Number(m[1]));
   }
   keywordSeq = max + 1;
@@ -239,8 +239,8 @@ function updateNodeLabel(nodeId, value) {
   );
 }
 
-function addKeywordNode() {
-  const id = `kw-${keywordSeq++}`;
+function addFlowNode(type) {
+  const id = `${type === 'exclude' ? 'ex' : 'kw'}-${keywordSeq++}`;
   let position = { x: 240, y: 140 + ((keywordSeq * 28) % 180) };
   try {
     if (vueFlowRef.value) {
@@ -255,7 +255,7 @@ function addKeywordNode() {
     ...nodes.value,
     {
       id,
-      type: 'keyword',
+      type,
       position,
       data: { label: '' },
       deletable: true,
@@ -268,10 +268,18 @@ function addKeywordNode() {
   });
 }
 
+function addKeywordNode() {
+  addFlowNode('keyword');
+}
+
+function addExcludeNode() {
+  addFlowNode('exclude');
+}
+
 function deleteSelected() {
   const node = selectedNode.value;
   if (!node) return;
-  if (node.type !== 'keyword') {
+  if (node.type !== 'keyword' && node.type !== 'exclude') {
     flash('Không thể xóa START/END', true);
     return;
   }
@@ -339,7 +347,7 @@ async function saveCurrentFilter({ apply = false, closeAfter = false } = {}) {
 
   const emptyIds = new Set(
     nextNodes
-      .filter((n) => n.type === 'keyword' && !String(n.data?.label || '').trim())
+      .filter((n) => (n.type === 'keyword' || n.type === 'exclude') && !String(n.data?.label || '').trim())
       .map((n) => n.id)
   );
   if (emptyIds.size) {
@@ -523,10 +531,13 @@ watch(
             <button class="btn btn--primary btn--inline" type="button" @click="addKeywordNode">
               + Thêm từ khóa
             </button>
+            <button class="btn btn--ghost btn--inline" type="button" @click="addExcludeNode">
+              + Loại trừ
+            </button>
             <button
               class="btn btn--ghost btn--inline"
               type="button"
-              :disabled="!selectedNode || selectedNode.type !== 'keyword'"
+              :disabled="!selectedNode || (selectedNode.type !== 'keyword' && selectedNode.type !== 'exclude')"
               @click="deleteSelected"
             >
               Xóa node
@@ -594,6 +605,27 @@ watch(
                   <Handle id="out" type="source" :position="Position.Right" />
                 </div>
               </template>
+
+              <template #node-exclude="nodeProps">
+                <div
+                  class="flow-node flow-node--exclude"
+                  :class="{ 'is-selected': nodeProps.selected }"
+                >
+                  <Handle id="in" type="target" :position="Position.Left" />
+                  <span class="flow-node-tag">Loại trừ</span>
+                  <input
+                    class="flow-node-input nodrag nopan"
+                    :data-kw-input="nodeProps.id"
+                    :value="nodeProps.data.label"
+                    type="text"
+                    placeholder="Từ khóa loại trừ…"
+                    @mousedown.stop
+                    @click.stop
+                    @input="updateNodeLabel(nodeProps.id, $event.target.value)"
+                  />
+                  <Handle id="out" type="source" :position="Position.Right" />
+                </div>
+              </template>
             </VueFlow>
           </div>
 
@@ -601,7 +633,7 @@ watch(
             <strong>Logic lọc</strong>
             <p v-if="expression" class="flow-expression">{{ expression }}</p>
             <p v-else class="muted">
-              Chưa có đường START → END có từ khóa. Ví dụ: START → Chung cư → Tây Hồ → END
+              Chưa có đường START → END. Ví dụ: START → Chung cư → Loại trừ ct04 → END
             </p>
             <p class="muted flow-hint">
               {{ paths.length }} nhánh hợp lệ · Lưu vào database khi bấm Lưu

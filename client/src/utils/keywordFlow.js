@@ -71,9 +71,11 @@ export function findKeywordPaths(nodes, edges) {
   const adj = buildAdj(edges);
   const paths = [];
 
-  function dfs(nodeId, trail, keywords) {
+  function dfs(nodeId, trail, include, exclude) {
     if (nodeId === 'end') {
-      if (keywords.length) paths.push([...keywords]);
+      if (include.length || exclude.length) {
+        paths.push({ include: [...include], exclude: [...exclude] });
+      }
       return;
     }
     for (const next of adj.get(nodeId) || []) {
@@ -82,42 +84,50 @@ export function findKeywordPaths(nodes, edges) {
       if (!node) continue;
       const nextTrail = new Set(trail);
       nextTrail.add(next);
-      const nextKeywords = [...keywords];
-      if (node.type === 'keyword') {
-        const label = String(node.data?.label || '').trim();
-        if (label) nextKeywords.push(label);
-      }
-      dfs(next, nextTrail, nextKeywords);
+      const nextInclude = [...include];
+      const nextExclude = [...exclude];
+      const label = String(node.data?.label || '').trim();
+      if (label && node.type === 'keyword') nextInclude.push(label);
+      if (label && node.type === 'exclude') nextExclude.push(label);
+      dfs(next, nextTrail, nextInclude, nextExclude);
     }
   }
 
-  dfs('start', new Set(['start']), []);
+  dfs('start', new Set(['start']), [], []);
   return paths;
 }
 
 export function formatPathsExpression(paths) {
   if (!paths.length) return '';
   return paths
-    .map((path) => path.map((k) => `"${k}"`).join(' AND '))
+    .map((path) => {
+      const include = Array.isArray(path) ? path : path.include || [];
+      const exclude = Array.isArray(path) ? [] : path.exclude || [];
+      return [
+        ...include.map((k) => `"${k}"`),
+        ...exclude.map((k) => `NOT "${k}"`),
+      ].join(' AND ');
+    })
     .join('  OR  ');
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export function matchHaystackAgainstPaths(haystack, paths) {
   if (!paths.length) return true;
   const text = toKeyword(haystack);
   if (!text) return false;
-  return paths.some((path) =>
-    path.every((keyword) => {
+  return paths.some((path) => {
+    const include = Array.isArray(path) ? path : path.include || [];
+    const exclude = Array.isArray(path) ? [] : path.exclude || [];
+    const hasAll = include.every((keyword) => {
       const needle = toKeyword(keyword);
-      if (!needle) return false;
-      const re = new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(needle)}(?=$|[^a-z0-9])`);
-      return re.test(text);
-    })
-  );
+      return needle && text.includes(needle);
+    });
+    const hasBlocked = exclude.some((keyword) => {
+      const needle = toKeyword(keyword);
+      return needle && text.includes(needle);
+    });
+    return hasAll && !hasBlocked;
+  });
 }
 
 export function serializeFlow(nodes, edges) {
@@ -127,7 +137,7 @@ export function serializeFlow(nodes, edges) {
       type: n.type,
       position: n.position,
       data: { label: n.data?.label || '' },
-      deletable: n.deletable !== false && n.type === 'keyword',
+      deletable: n.deletable !== false && (n.type === 'keyword' || n.type === 'exclude'),
     })),
     edges: edges.map((e) => ({
       id: e.id,
@@ -149,7 +159,7 @@ export function parseFlow(raw) {
     return {
       nodes: data.nodes.map((n) => ({
         ...n,
-        deletable: n.type === 'keyword',
+        deletable: n.type === 'keyword' || n.type === 'exclude',
         data: {
           label:
             n.data?.label ||

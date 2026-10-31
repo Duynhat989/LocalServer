@@ -6,8 +6,12 @@ function filterKeywords(nodesJson) {
     const nodes = JSON.parse(nodesJson || '[]');
     if (!Array.isArray(nodes)) return [];
     return nodes
-      .filter((node) => node && node.type === 'keyword')
-      .map((node) => String(node.data?.label || '').trim())
+      .filter((node) => node && (node.type === 'keyword' || node.type === 'exclude'))
+      .map((node) => {
+        const label = String(node.data?.label || '').trim();
+        if (!label) return '';
+        return node.type === 'exclude' ? `loại trừ: ${label}` : label;
+      })
       .filter(Boolean)
       .slice(0, 40);
   } catch {

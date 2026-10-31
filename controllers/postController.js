@@ -42,12 +42,22 @@ function parsePaths(raw) {
     const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (!Array.isArray(data)) return [];
     return data
-      .map((path) =>
-        Array.isArray(path)
-          ? path.map((k) => toKeyword(k)).filter(Boolean)
-          : []
-      )
-      .filter((path) => path.length);
+      .map((path) => {
+        if (Array.isArray(path)) {
+          return {
+            include: path.map((k) => toKeyword(k)).filter(Boolean),
+            exclude: [],
+          };
+        }
+        if (!path || typeof path !== 'object') return { include: [], exclude: [] };
+        const include = Array.isArray(path.include) ? path.include : [];
+        const exclude = Array.isArray(path.exclude) ? path.exclude : [];
+        return {
+          include: include.map((k) => toKeyword(k)).filter(Boolean),
+          exclude: exclude.map((k) => toKeyword(k)).filter(Boolean),
+        };
+      })
+      .filter((path) => path.include.length || path.exclude.length);
   } catch {
     return [];
   }
@@ -62,12 +72,14 @@ function keywordPathsWhere(paths) {
   const groups = [];
 
   for (const path of paths) {
+    const include = Array.isArray(path) ? path : path.include || [];
+    const exclude = Array.isArray(path) ? [] : path.exclude || [];
     const phrases = [];
     const scans = [];
-    for (const needle of path) {
+    for (const needle of include) {
       if (!needle) continue;
       if (needle.length >= 3) phrases.push(ftsPhrase(needle));
-      else scans.push(`instr(keyword, ${sequelize.escape(needle)}) > 0`);
+      else scans.push(`instr(IFNULL(keyword, ''), ${sequelize.escape(needle)}) > 0`);
     }
 
     const and = [];
@@ -78,6 +90,16 @@ function keywordPathsWhere(paths) {
       );
     }
     and.push(...scans);
+    for (const needle of exclude) {
+      if (!needle) continue;
+      if (needle.length >= 3) {
+        and.push(
+          `id NOT IN (SELECT rowid FROM post_keyword_fts WHERE post_keyword_fts MATCH ${sequelize.escape(ftsPhrase(needle))})`
+        );
+      } else {
+        and.push(`instr(IFNULL(keyword, ''), ${sequelize.escape(needle)}) = 0`);
+      }
+    }
     if (and.length) groups.push(and.length === 1 ? and[0] : `(${and.join(' AND ')})`);
   }
 

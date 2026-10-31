@@ -1642,6 +1642,27 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   border-color: var(--orange);
 }
 
+.flow-node--exclude {
+  min-width: 140px;
+  padding: 8px 12px;
+  border-color: #fecaca;
+  background: #fff7f7;
+}
+
+.flow-node--exclude.is-selected,
+.flow-node--exclude:hover {
+  border-color: var(--danger);
+}
+
+.flow-node-tag {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--danger);
+}
+
 .flow-node-input {
   width: 120px;
   max-width: 160px;
