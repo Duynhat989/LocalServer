@@ -243,6 +243,7 @@ async function claimGroup(req, res) {
       status: 'active',
       claimedAt: now,
       claimedBy,
+      scannedAt: now,
       lastStopReason: null,
     });
 

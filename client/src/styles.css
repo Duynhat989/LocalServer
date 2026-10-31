@@ -2100,6 +2100,12 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   box-shadow: 0 0 0 4px rgba(255, 106, 26, 0.12);
 }
 
+.status-cell {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
 .status-select {
   height: 30px;
   border: 1.5px solid var(--line);
@@ -2109,7 +2115,7 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   font-size: 0.72rem;
   color: var(--ink);
   outline: none;
-  max-width: 130px;
+  max-width: 180px;
 }
 
 .status-select:focus {

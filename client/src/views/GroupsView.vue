@@ -8,7 +8,7 @@ import LoadingState from '../components/LoadingState.vue';
 
 const STATUS_OPTIONS = [
   { value: 'pending', label: 'Chờ quét' },
-  { value: 'active', label: 'Đang quét' },
+  { value: 'active', label: 'Đang claim' },
   { value: 'paused', label: 'Tạm dừng' },
   { value: 'done', label: 'Xong' },
   { value: 'error', label: 'Lỗi' },
@@ -20,6 +20,9 @@ const totals = ref({ posts: 0, phones: 0 });
 const loading = ref(true);
 const error = ref('');
 const searchQuery = ref('');
+const statusFilter = ref('');
+const scannedFrom = ref('');
+const scannedTo = ref('');
 const actionMsg = ref('');
 const actionError = ref('');
 const busyId = ref(null);
@@ -59,18 +62,42 @@ function statusLabel(value) {
   return STATUS_OPTIONS.find((s) => s.value === value)?.label || value || '—';
 }
 
+function claimLabel(group) {
+  if (group?.status !== 'active') return '';
+  return `Đang claim · ${group.claimedBy || '—'}`;
+}
+
+function statusDisplay(group) {
+  return claimLabel(group) || statusLabel(group?.status);
+}
+
 function statusClass(value) {
   return `tag tag--status-${value || 'pending'}`;
 }
 
-function formatScannedAt(value) {
-  if (value == null || value === '') return '—';
+function scannedAtMs(value) {
+  if (value == null || value === '') return null;
   const n = Number(value);
-  if (!Number.isFinite(n)) return String(value);
-  const ms = n < 1e12 ? n * 1000 : n;
+  if (!Number.isFinite(n)) return null;
+  return n < 1e12 ? n * 1000 : n;
+}
+
+function formatScannedAt(value) {
+  const ms = scannedAtMs(value);
+  if (ms == null) return value == null || value === '' ? '—' : String(value);
   const date = new Date(ms);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString('vi-VN', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+function dayStartMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T00:00:00`).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function dayEndMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T23:59:59.999`).getTime();
+  return Number.isNaN(ms) ? null : ms;
 }
 
 function formatMs(value) {
@@ -92,13 +119,41 @@ function stopReasonLabel(value) {
   return map[value] || value || '—';
 }
 
+const hasListFilter = computed(
+  () =>
+    Boolean(String(searchQuery.value || '').trim()) ||
+    Boolean(statusFilter.value) ||
+    Boolean(scannedFrom.value) ||
+    Boolean(scannedTo.value)
+);
+
 const filteredGroups = computed(() => {
   const q = String(searchQuery.value || '')
     .trim()
     .toLowerCase();
-  if (!q) return groups.value;
+  const status = statusFilter.value;
+  const fromMs = scannedFrom.value ? dayStartMs(scannedFrom.value) : null;
+  const toMs = scannedTo.value ? dayEndMs(scannedTo.value) : null;
+
   return groups.value.filter((g) => {
-    const hay = [g.uid, g.name, g.link, g.status, g.note, statusLabel(g.status)]
+    if (status && g.status !== status) return false;
+    if (fromMs != null || toMs != null) {
+      const ms = scannedAtMs(g.scannedAt);
+      if (ms == null) return false;
+      if (fromMs != null && ms < fromMs) return false;
+      if (toMs != null && ms > toMs) return false;
+    }
+    if (!q) return true;
+    const hay = [
+      g.uid,
+      g.name,
+      g.link,
+      g.status,
+      g.note,
+      g.claimedBy,
+      statusLabel(g.status),
+      claimLabel(g),
+    ]
       .filter(Boolean)
       .join(' ')
       .toLowerCase();
@@ -339,7 +394,7 @@ onMounted(async () => {
         <h3>Danh sách nhóm</h3>
         <p>
           {{ filteredGroups.length }} nhóm
-          <span v-if="searchQuery.trim()"> · lọc từ {{ groups.length }}</span>
+          <span v-if="hasListFilter"> · lọc từ {{ groups.length }}</span>
           · {{ totals.posts }} bài · {{ totals.phones }} SĐT
         </p>
       </div>
@@ -403,15 +458,49 @@ onMounted(async () => {
       </div>
     </div>
 
-    <div class="posts-toolbar">
-      <div class="search-box">
-        <label class="sr-only" for="group-search">Tìm nhóm</label>
-        <input
-          id="group-search"
-          v-model="searchQuery"
-          type="search"
-          placeholder="Tìm uid, tên, link, trạng thái…"
-        />
+    <div class="posts-control">
+      <div class="posts-filter-panel">
+        <label class="pf-field">
+          <span class="sr-only">Tìm nhóm</span>
+          <input
+            id="group-search"
+            v-model="searchQuery"
+            class="pf-field__control"
+            type="search"
+            placeholder="Tìm uid, tên, link…"
+          />
+        </label>
+        <label class="pf-field">
+          <span class="pf-field__label">Trạng thái</span>
+          <select
+            v-model="statusFilter"
+            class="pf-field__control"
+            aria-label="Lọc theo trạng thái"
+          >
+            <option value="">Tất cả</option>
+            <option v-for="opt in STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+        </label>
+        <div class="pf-field pf-field--span">
+          <span class="pf-field__label">Scanned at</span>
+          <div class="pf-dates">
+            <input
+              v-model="scannedFrom"
+              class="pf-field__control"
+              type="date"
+              aria-label="Scanned từ ngày"
+            />
+            <span class="pf-dates__sep" aria-hidden="true">→</span>
+            <input
+              v-model="scannedTo"
+              class="pf-field__control"
+              type="date"
+              aria-label="Scanned đến ngày"
+            />
+          </div>
+        </div>
       </div>
     </div>
 
@@ -478,21 +567,23 @@ onMounted(async () => {
               </RouterLink>
             </td>
             <td @click.stop>
-              <select
-                v-if="isStaff"
-                class="status-select"
-                :value="g.status"
-                :disabled="busyId === g.id"
-                @change="onStatusChange(g, $event)"
-              >
-                <option v-for="opt in STATUS_OPTIONS" :key="opt.value" :value="opt.value">
-                  {{ opt.label }}
-                </option>
-              </select>
-              <span v-else :class="statusClass(g.status)">{{ statusLabel(g.status) }}</span>
+              <div class="status-cell">
+                <select
+                  v-if="isStaff"
+                  class="status-select"
+                  :value="g.status"
+                  :disabled="busyId === g.id"
+                  @change="onStatusChange(g, $event)"
+                >
+                  <option v-for="opt in STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+                    {{ opt.value === 'active' && g.claimedBy ? claimLabel(g) : opt.label }}
+                  </option>
+                </select>
+                <span v-else :class="statusClass(g.status)">{{ statusDisplay(g) }}</span>
+              </div>
             </td>
             <td class="muted">
-              <span v-if="g.status === 'active'">Đang claim · {{ g.claimedBy || '—' }}</span>
+              <span v-if="g.status === 'active'">{{ claimLabel(g) }}</span>
               <span v-else-if="g.isAvailable" class="tag tag--status-active">Sẵn sàng</span>
               <span v-else>{{ formatMs(g.availableAt) }}</span>
             </td>
@@ -503,7 +594,9 @@ onMounted(async () => {
         </tbody>
       </table>
     </div>
-    <p v-else class="empty">Chưa có nhóm nào.</p>
+    <p v-else class="empty">
+      {{ groups.length ? 'Không có nhóm khớp bộ lọc.' : 'Chưa có nhóm nào.' }}
+    </p>
   </section>
 
   <Teleport to="body">
@@ -536,7 +629,7 @@ onMounted(async () => {
             <span class="muted">Trạng thái</span>
             <p>
               <span :class="statusClass(detailGroup.status)">
-                {{ statusLabel(detailGroup.status) }}
+                {{ statusDisplay(detailGroup) }}
               </span>
             </p>
           </div>
@@ -560,7 +653,7 @@ onMounted(async () => {
             <span class="muted">Khả dụng</span>
             <p>
               <template v-if="detailGroup.status === 'active'">
-                Đang claim · {{ detailGroup.claimedBy || '—' }}
+                {{ claimLabel(detailGroup) }}
               </template>
               <template v-else-if="detailGroup.isAvailable">Sẵn sàng</template>
               <template v-else>{{ formatMs(detailGroup.availableAt) }}</template>
