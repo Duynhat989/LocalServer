@@ -22,7 +22,7 @@ const {
   getMysqlConfig,
   shouldResetDatabase,
 } = require('../utils/dbConfig');
-const { migrateSqliteFileToMysql } = require('../utils/sqliteToMysql');
+const { startSqliteToMysqlMigration } = require('../utils/sqliteToMysql');
 
 function getDbPath() {
   return path.join(getDataDir(), 'localserver.db');
@@ -386,6 +386,14 @@ async function runMigrations({ force }) {
   }
 }
 
+function logMigrateQueued(sqlitePath) {
+  if (fs.existsSync(sqlitePath)) {
+    console.log(
+      '[migrate] Đồng bộ SQLite → MySQL chạy nền (posts sau). Server không chờ migrate.'
+    );
+  }
+}
+
 function getModelBag() {
   return {
     User,
@@ -423,11 +431,17 @@ async function initDatabase({ force } = {}) {
     await runMigrations({ force: shouldForce });
 
     const sqlitePath = getDbPath();
-    await migrateSqliteFileToMysql(getModelBag(), sqlitePath, dataDir);
 
-    await seedAdmin(User);
-    await seedSamplePost(Post);
-    await ensurePostKeywordIndex(sequelize);
+    async function afterSqliteMigrationOrSkip() {
+      await seedAdmin(User);
+      await seedSamplePost(Post);
+      await ensurePostKeywordIndex(sequelize);
+    }
+
+    startSqliteToMysqlMigration(getModelBag(), sqlitePath, dataDir, {
+      onComplete: afterSqliteMigrationOrSkip,
+    });
+    logMigrateQueued(sqlitePath);
   } else {
     const markerPath = path.join(dataDir, '.sequelize');
     const shouldForce =

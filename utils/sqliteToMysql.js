@@ -12,8 +12,43 @@ const { defineAppSetting } = require('../models/AppSetting');
 const { defineApiKey } = require('../models/ApiKey');
 const { defineActivityLog } = require('../models/ActivityLog');
 
-/** Số dòng copy mỗi lần bulkCreate sang MySQL */
-const BATCH = 10_000;
+/** Lô tối đa cho bảng nhẹ (users, groups, …) */
+const BATCH_DEFAULT = 10_000;
+
+/** Bảng có TEXT lớn — tránh vượt max_allowed_packet MySQL */
+const BATCH_HEAVY = 400;
+
+const BATCH_BY_LABEL = {
+  posts: BATCH_HEAVY,
+  campaign_phones: BATCH_HEAVY,
+  activity_logs: 800,
+  keyword_filters: 2000,
+};
+
+function batchSizeFor(label) {
+  return BATCH_BY_LABEL[label] ?? BATCH_DEFAULT;
+}
+
+function isPacketTooLarge(err) {
+  const p = err?.parent || err?.original || err;
+  return (
+    p?.errno === 1153 ||
+    p?.code === 'ER_NET_PACKET_TOO_LARGE' ||
+    /max_allowed_packet/i.test(String(p?.message || err?.message || ''))
+  );
+}
+
+async function safeBulkCreate(targetModel, rows) {
+  if (!rows.length) return;
+  try {
+    await targetModel.bulkCreate(rows, { ignoreDuplicates: true });
+  } catch (err) {
+    if (!isPacketTooLarge(err) || rows.length <= 1) throw err;
+    const mid = Math.ceil(rows.length / 2);
+    await safeBulkCreate(targetModel, rows.slice(0, mid));
+    await safeBulkCreate(targetModel, rows.slice(mid));
+  }
+}
 
 function migrationMarkerPath(dataDir) {
   return path.join(dataDir, '.sqlite-migrated-to-mysql.json');
@@ -83,7 +118,8 @@ async function copyInBatches(sourceModel, targetModel, label) {
     return 0;
   }
 
-  logMigrate(`${label}: bắt đầu — ${total} dòng, mỗi lô tối đa ${BATCH}`);
+  const batchSize = batchSizeFor(label);
+  logMigrate(`${label}: bắt đầu — ${total} dòng, đọc ${batchSize} dòng/lô (bulk tự chia nếu packet lớn)`);
   const started = Date.now();
   let copied = 0;
   let lastId = 0;
@@ -93,20 +129,20 @@ async function copyInBatches(sourceModel, targetModel, label) {
     const rows = await sourceModel.findAll({
       where: { id: { [Op.gt]: lastId } },
       order: [['id', 'ASC']],
-      limit: BATCH,
+      limit: batchSize,
       raw: true,
     });
     if (!rows.length) break;
 
     batchNo += 1;
-    await targetModel.bulkCreate(rows, { ignoreDuplicates: true });
+    await safeBulkCreate(targetModel, rows);
     copied += rows.length;
     lastId = rows[rows.length - 1].id;
 
     const pct = Math.min(100, Math.round((copied / total) * 100));
     logMigrate(`${label}: lô ${batchNo} — đã đẩy ${copied}/${total} (${pct}%)`);
 
-    if (rows.length < BATCH) break;
+    if (rows.length < batchSize) break;
   }
 
   const sec = ((Date.now() - started) / 1000).toFixed(1);
@@ -120,8 +156,8 @@ async function copyAllRows(sourceModel, targetModel, label) {
     logMigrate(`${label}: 0 dòng — bỏ qua`);
     return 0;
   }
-  logMigrate(`${label}: đẩy ${rows.length} dòng (một lần)`);
-  await targetModel.bulkCreate(rows, { ignoreDuplicates: true });
+  logMigrate(`${label}: đẩy ${rows.length} dòng`);
+  await safeBulkCreate(targetModel, rows);
   logMigrate(`${label}: xong — ${rows.length} dòng`);
   return rows.length;
 }
@@ -136,10 +172,28 @@ async function bumpAutoIncrement(sequelize, table, idColumn = 'id') {
   }
 }
 
+const migrationState = {
+  running: false,
+  phase: 'idle',
+  error: null,
+  startedAt: null,
+  promise: null,
+};
+
+function getSqliteMigrationStatus() {
+  return {
+    running: migrationState.running,
+    phase: migrationState.phase,
+    error: migrationState.error,
+    startedAt: migrationState.startedAt,
+  };
+}
+
 /**
  * Copy data from legacy SQLite file into active MySQL models.
  */
-async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir) {
+async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir, hooks = {}) {
+  const onPhase = hooks.onPhase || (() => {});
   if (!fs.existsSync(sqlitePath)) {
     return { skipped: true, reason: 'no-sqlite-file' };
   }
@@ -173,10 +227,15 @@ async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir) {
   const migrateStarted = Date.now();
   logMigrate('════════════════════════════════════════');
   logMigrate(`Bắt đầu SQLite → MySQL: ${sqlitePath}`);
-  logMigrate(`Cấu hình: ${BATCH} dòng / lô bulkCreate`);
+  logMigrate(
+    `Cấu hình: bảng nhẹ ${BATCH_DEFAULT} dòng/lô · posts/campaign_phones ${BATCH_HEAVY} dòng/lô`
+  );
   logMigrate('════════════════════════════════════════');
 
   const counts = {};
+
+  onPhase('core');
+  logMigrate('Bảng cấu hình / metadata (users, groups, …) — chạy nền');
   counts.users = await copyInBatches(src.User, dest.User, 'users');
   counts.groups = await copyInBatches(src.Group, dest.Group, 'groups');
   counts.campaigns = await copyInBatches(src.Campaign, dest.Campaign, 'campaigns');
@@ -185,6 +244,12 @@ async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir) {
     dest.KeywordFilter,
     'keyword_filters'
   );
+  counts.sessions = await copyAllRows(src.Session, dest.Session, 'sessions');
+  counts.api_keys = await copyAllRows(src.ApiKey, dest.ApiKey, 'api_keys');
+  counts.app_settings = await copyAllRows(src.AppSetting, dest.AppSetting, 'app_settings');
+
+  onPhase('posts');
+  logMigrate('posts / campaign_phones / activity_logs — đồng bộ ngầm (server có thể dùng trước)');
   counts.posts = await copyInBatches(src.Post, dest.Post, 'posts');
   counts.campaign_phones = await copyInBatches(
     src.CampaignPhone,
@@ -197,9 +262,7 @@ async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir) {
     'activity_logs'
   );
 
-  counts.sessions = await copyAllRows(src.Session, dest.Session, 'sessions');
-  counts.api_keys = await copyAllRows(src.ApiKey, dest.ApiKey, 'api_keys');
-  counts.app_settings = await copyAllRows(src.AppSetting, dest.AppSetting, 'app_settings');
+  onPhase('finalize');
 
   logMigrate('Đang cập nhật AUTO_INCREMENT…');
   for (const table of [
@@ -228,8 +291,58 @@ async function migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir) {
   return { ok: true, counts, backupPath };
 }
 
+/**
+ * Chạy SQLite → MySQL không chặn startup. Gọi onComplete khi xong hoặc bỏ qua.
+ */
+function startSqliteToMysqlMigration(mysqlModels, sqlitePath, dataDir, { onComplete } = {}) {
+  if (migrationState.promise) {
+    return migrationState.promise;
+  }
+
+  migrationState.running = true;
+  migrationState.phase = 'starting';
+  migrationState.error = null;
+  migrationState.startedAt = new Date().toISOString();
+
+  migrationState.promise = (async () => {
+    try {
+      const result = await migrateSqliteFileToMysql(mysqlModels, sqlitePath, dataDir, {
+        onPhase(phase) {
+          migrationState.phase = phase;
+        },
+      });
+
+      migrationState.phase = result.skipped ? 'skipped' : 'done';
+      if (typeof onComplete === 'function') {
+        await onComplete(result);
+      }
+      return result;
+    } catch (err) {
+      migrationState.phase = 'error';
+      migrationState.error = err.message || String(err);
+      console.error('[migrate] Lỗi đồng bộ nền:', migrationState.error);
+      if (typeof onComplete === 'function') {
+        try {
+          await onComplete({ skipped: true, reason: 'error', error: err });
+        } catch (hookErr) {
+          console.error('[migrate] onComplete:', hookErr.message || hookErr);
+        }
+      }
+      throw err;
+    } finally {
+      migrationState.running = false;
+    }
+  })();
+
+  return migrationState.promise;
+}
+
 module.exports = {
   migrateSqliteFileToMysql,
+  startSqliteToMysqlMigration,
+  getSqliteMigrationStatus,
   migrationMarkerPath,
-  BATCH,
+  BATCH_DEFAULT,
+  BATCH_HEAVY,
+  safeBulkCreate,
 };

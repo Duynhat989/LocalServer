@@ -15,6 +15,7 @@ const {
   startFilterPostsSyncWorker,
   stopFilterPostsSyncWorker,
 } = require('./jobs/filterPostsSync');
+const { getSqliteMigrationStatus } = require('./utils/sqliteToMysql');
 
 const PORT = 6868;
 
@@ -26,7 +27,11 @@ async function createServer() {
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', port: PORT });
+    res.json({
+      status: 'ok',
+      port: PORT,
+      sqliteMigration: getSqliteMigrationStatus(),
+    });
   });
 
   app.use('/api', apiRoutes);
