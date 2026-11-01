@@ -5,7 +5,7 @@ function defineSession(sequelize) {
     'Session',
     {
       token: {
-        type: DataTypes.TEXT,
+        type: DataTypes.STRING(767),
         primaryKey: true,
       },
       userId: {

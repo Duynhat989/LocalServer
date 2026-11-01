@@ -5,6 +5,7 @@ const { requireAuth, requireStaff } = require('../middleware/auth');
 const router = express.Router();
 
 router.get('/', requireAuth, requireStaff, keywordFilterController.listFilters);
+router.get('/:id/sync', requireAuth, requireStaff, keywordFilterController.getFilterSyncStatus);
 router.get('/:id', requireAuth, requireStaff, keywordFilterController.getFilter);
 router.post('/', requireAuth, requireStaff, keywordFilterController.createFilter);
 router.patch('/:id', requireAuth, requireStaff, keywordFilterController.updateFilter);

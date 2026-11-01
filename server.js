@@ -1,3 +1,5 @@
+require('./utils/loadEnv').loadEnv();
+
 const express = require('express');
 const http = require('http');
 const path = require('path');
@@ -9,6 +11,10 @@ const {
   startGroupAvailabilityCron,
   stopGroupAvailabilityCron,
 } = require('./jobs/groupAvailability');
+const {
+  startFilterPostsSyncWorker,
+  stopFilterPostsSyncWorker,
+} = require('./jobs/filterPostsSync');
 
 const PORT = 6868;
 
@@ -54,12 +60,14 @@ async function createServer() {
         server.listen(PORT, '0.0.0.0', () => {
           server.removeListener('error', reject);
           startGroupAvailabilityCron();
+          startFilterPostsSyncWorker();
           resolve({ port: PORT, url: getLocalWebUrl(PORT) });
         });
       });
     },
     async stop() {
       stopGroupAvailabilityCron();
+      stopFilterPostsSyncWorker();
       try {
         await db.close();
       } catch (_) {

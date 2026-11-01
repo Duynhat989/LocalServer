@@ -22,6 +22,11 @@ const {
   toPublicKeywordFilter,
   normalizeKeywordFilterInput,
 } = require('../utils/keywordFilter');
+const {
+  scheduleFilterFullSync,
+  invalidateFiltersCache,
+  getFilterSyncPublic,
+} = require('../jobs/filterPostsSync');
 
 async function listFilters(req, res, next) {
   try {
@@ -70,7 +75,9 @@ async function createFilter(req, res) {
         keywords: filterKeywords(payload.nodesJson),
       },
     });
-    res.status(201).json({ ok: true, filter: toPublicKeywordFilter(row) });
+    invalidateFiltersCache();
+    await scheduleFilterFullSync(row.id);
+    res.status(201).json({ ok: true, filter: toPublicKeywordFilter(await row.reload()) });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message || 'Không tạo được bộ lọc' });
   }
@@ -99,6 +106,8 @@ async function updateFilter(req, res) {
     }
 
     const previousName = current.name;
+    const graphChanged =
+      payload.nodesJson !== row.nodesJson || payload.edgesJson !== row.edgesJson;
     await row.update(payload);
     const renamed = previousName && previousName !== payload.name;
     await recordActivity({
@@ -116,7 +125,11 @@ async function updateFilter(req, res) {
         keywords: filterKeywords(payload.nodesJson),
       },
     });
-    res.json({ ok: true, filter: toPublicKeywordFilter(row) });
+    if (graphChanged) {
+      invalidateFiltersCache();
+      await scheduleFilterFullSync(row.id);
+    }
+    res.json({ ok: true, filter: toPublicKeywordFilter(await row.reload()) });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message || 'Không cập nhật được bộ lọc' });
   }
@@ -134,9 +147,26 @@ async function deleteFilter(req, res) {
       return res.status(404).json({ ok: false, error: 'Không tìm thấy bộ lọc' });
     }
     await row.destroy();
+    invalidateFiltersCache();
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message || 'Không xóa được bộ lọc' });
+  }
+}
+
+async function getFilterSyncStatus(req, res, next) {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, error: 'ID không hợp lệ' });
+    }
+    const sync = await getFilterSyncPublic(id);
+    if (!sync) {
+      return res.status(404).json({ ok: false, error: 'Không tìm thấy bộ lọc' });
+    }
+    res.json({ ok: true, sync });
+  } catch (err) {
+    next(err);
   }
 }
 
@@ -146,4 +176,5 @@ module.exports = {
   createFilter,
   updateFilter,
   deleteFilter,
+  getFilterSyncStatus,
 };

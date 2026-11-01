@@ -11,10 +11,18 @@ const { defineKeywordFilter } = require('./KeywordFilter');
 const { defineAppSetting } = require('./AppSetting');
 const { defineApiKey } = require('./ApiKey');
 const { defineActivityLog } = require('./ActivityLog');
+const { defineFilterPost } = require('./FilterPost');
 const { hashPassword } = require('../utils/password');
 const { buildPostKeyword } = require('../utils/text');
 const { getDataDir } = require('../utils/dataDir');
 const { ensurePostKeywordIndex } = require('../utils/postKeywordIndex');
+const { loadEnv } = require('../utils/loadEnv');
+const {
+  isMysqlConfigured,
+  getMysqlConfig,
+  shouldResetDatabase,
+} = require('../utils/dbConfig');
+const { migrateSqliteFileToMysql } = require('../utils/sqliteToMysql');
 
 function getDbPath() {
   return path.join(getDataDir(), 'localserver.db');
@@ -31,8 +39,34 @@ let KeywordFilter = null;
 let AppSetting = null;
 let ApiKey = null;
 let ActivityLog = null;
+let FilterPost = null;
 
-function createSequelize() {
+const MODEL_DEFINE = {
+  underscored: false,
+  freezeTableName: true,
+};
+
+function createMysqlSequelize() {
+  const cfg = getMysqlConfig();
+  return new Sequelize(cfg.database, cfg.username, cfg.password, {
+    host: cfg.host,
+    port: cfg.port,
+    dialect: 'mysql',
+    logging: false,
+    define: MODEL_DEFINE,
+    dialectOptions: {
+      charset: 'utf8mb4',
+    },
+    pool: {
+      max: 10,
+      min: 0,
+      acquire: 60000,
+      idle: 10000,
+    },
+  });
+}
+
+function createSqliteSequelize() {
   const dataDir = getDataDir();
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -42,10 +76,34 @@ function createSequelize() {
     dialect: 'sqlite',
     storage: getDbPath(),
     logging: false,
-    define: {
-      underscored: false,
-      freezeTableName: true,
-    },
+    define: MODEL_DEFINE,
+  });
+}
+
+function registerModels(seq) {
+  User = defineUser(seq);
+  Session = defineSession(seq);
+  Post = definePost(seq);
+  Group = defineGroup(seq);
+  Campaign = defineCampaign(seq);
+  CampaignPhone = defineCampaignPhone(seq);
+  KeywordFilter = defineKeywordFilter(seq);
+  AppSetting = defineAppSetting(seq);
+  ApiKey = defineApiKey(seq);
+  ActivityLog = defineActivityLog(seq);
+  FilterPost = defineFilterPost(seq);
+  associateModels({
+    User,
+    Session,
+    Post,
+    Group,
+    Campaign,
+    CampaignPhone,
+    KeywordFilter,
+    AppSetting,
+    ApiKey,
+    ActivityLog,
+    FilterPost,
   });
 }
 
@@ -79,6 +137,27 @@ function associateModels(models) {
     foreignKey: 'userId',
     as: 'user',
   });
+
+  if (models.FilterPost) {
+    models.KeywordFilter.hasMany(models.FilterPost, {
+      foreignKey: 'filterId',
+      as: 'filterPosts',
+      onDelete: 'CASCADE',
+    });
+    models.FilterPost.belongsTo(models.KeywordFilter, {
+      foreignKey: 'filterId',
+      as: 'filter',
+    });
+    models.Post.hasMany(models.FilterPost, {
+      foreignKey: 'postId',
+      as: 'filterPosts',
+      onDelete: 'CASCADE',
+    });
+    models.FilterPost.belongsTo(models.Post, {
+      foreignKey: 'postId',
+      as: 'post',
+    });
+  }
 }
 
 async function seedAdmin(UserModel) {
@@ -118,9 +197,6 @@ async function seedSamplePost(PostModel) {
     keyword: buildPostKeyword({
       postMessage:
         '🔥 49,5 TỶ SỞ HỮU BIỆT THỰ LÔ GÓC HÀM NGHI – 131M², 6 TẦNG, MẶT TIỀN 6M – VỈA HÈ 6M, 3 Ô TÔ TRÁNH NHAU! 🔥',
-      phone: '0913003917',
-      userName: 'Nguyễn Minh Đức',
-      groupName: '1000832851236530',
     }),
   });
 }
@@ -133,25 +209,63 @@ function removeOldDbFiles() {
   }
 }
 
-async function ensureColumn(table, column, definition) {
+async function sqliteColumnExists(table, column) {
   const [rows] = await sequelize.query(`PRAGMA table_info(${table})`);
-  const exists = rows.some((row) => row.name === column);
+  return rows.some((row) => row.name === column);
+}
+
+async function mysqlColumnExists(table, column) {
+  const [rows] = await sequelize.query(
+    `SELECT 1 AS ok FROM information_schema.columns
+     WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
+     LIMIT 1`,
+    { replacements: [table, column] }
+  );
+  return rows.length > 0;
+}
+
+async function ensureColumn(table, column, definition) {
+  const dialect = sequelize.getDialect();
+  const exists =
+    dialect === 'mysql'
+      ? await mysqlColumnExists(table, column)
+      : await sqliteColumnExists(table, column);
   if (exists) return;
-  await sequelize.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  await sequelize.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
   console.log(`Added column ${table}.${column}`);
 }
 
-async function ensureIndex(name, sql) {
+async function sqliteIndexExists(name) {
   const [rows] = await sequelize.query(
     `SELECT name FROM sqlite_master WHERE type='index' AND name = ?`,
     { replacements: [name] }
   );
-  if (rows.length) return;
+  return rows.length > 0;
+}
+
+async function mysqlIndexExists(name, table) {
+  const [rows] = await sequelize.query(
+    `SELECT 1 AS ok FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?
+     LIMIT 1`,
+    { replacements: [table, name] }
+  );
+  return rows.length > 0;
+}
+
+async function ensureIndex(name, sql, tableForMysql) {
+  const dialect = sequelize.getDialect();
+  const exists =
+    dialect === 'mysql'
+      ? await mysqlIndexExists(name, tableForMysql)
+      : await sqliteIndexExists(name);
+  if (exists) return;
   await sequelize.query(sql);
   console.log(`Added index ${name}`);
 }
 
 async function cleanupBackupTables() {
+  if (sequelize.getDialect() !== 'sqlite') return;
   const [rows] = await sequelize.query(
     `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_backup'`
   );
@@ -160,9 +274,44 @@ async function cleanupBackupTables() {
   }
 }
 
-async function safeSync({ force }) {
-  // SQLite + alter thường gây FOREIGN KEY constraint failed.
-  await sequelize.query('PRAGMA foreign_keys = OFF');
+async function ensurePerformanceIndexes() {
+  const dialect = sequelize.getDialect();
+  if (dialect !== 'mysql' && dialect !== 'sqlite') return;
+
+  await ensureIndex(
+    'posts_group_id_idx',
+    'CREATE INDEX `posts_group_id_idx` ON `posts` (`group_id`)',
+    'posts'
+  );
+  await ensureIndex(
+    'posts_scanned_at_idx',
+    'CREATE INDEX `posts_scanned_at_idx` ON `posts` (`scanned_at`)',
+    'posts'
+  );
+  await ensureIndex(
+    'posts_phone_idx',
+    'CREATE INDEX `posts_phone_idx` ON `posts` (`phone`)',
+    'posts'
+  );
+  await ensureIndex(
+    'posts_group_scanned_id_idx',
+    'CREATE INDEX `posts_group_scanned_id_idx` ON `posts` (`group_id`, `scanned_at`, `id`)',
+    'posts'
+  );
+  await ensureIndex(
+    'posts_created_time_id_idx',
+    'CREATE INDEX `posts_created_time_id_idx` ON `posts` (`created_time`, `id`)',
+    'posts'
+  );
+}
+
+async function runMigrations({ force }) {
+  const dialect = sequelize.getDialect();
+
+  if (dialect === 'sqlite') {
+    await sequelize.query('PRAGMA foreign_keys = OFF');
+  }
+
   try {
     if (force) {
       await sequelize.sync({ force: true });
@@ -179,12 +328,22 @@ async function safeSync({ force }) {
     await AppSetting.sync();
     await ApiKey.sync();
     await ActivityLog.sync();
+    await FilterPost.sync();
+
+    await ensureColumn('keyword_filters', 'sync_generation', 'BIGINT NOT NULL DEFAULT 0');
+    await ensureColumn('keyword_filters', 'sync_status', "VARCHAR(16) NOT NULL DEFAULT 'idle'");
+    await ensureColumn('keyword_filters', 'sync_started_at', 'DATETIME NULL');
+    await ensureColumn('keyword_filters', 'sync_finished_at', 'DATETIME NULL');
+    await ensureColumn('keyword_filters', 'sync_processed', 'INT NOT NULL DEFAULT 0');
+    await ensureColumn('keyword_filters', 'sync_matched', 'INT NOT NULL DEFAULT 0');
+    await ensureColumn('keyword_filters', 'sync_error', 'TEXT NULL');
 
     await ensureColumn('users', 'locked', 'TINYINT(1) NOT NULL DEFAULT 0');
     await ensureColumn('sessions', 'jti', 'VARCHAR(64)');
     await ensureIndex(
       'sessions_jti_unique',
-      'CREATE UNIQUE INDEX `sessions_jti_unique` ON `sessions` (`jti`)'
+      'CREATE UNIQUE INDEX `sessions_jti_unique` ON `sessions` (`jti`)',
+      'sessions'
     );
     await ensureColumn('posts', 'keyword', 'TEXT');
     await ensureColumn('groups', 'note', 'TEXT');
@@ -213,74 +372,88 @@ async function safeSync({ force }) {
     await ensureColumn('campaign_phones', 'is_used', 'TINYINT(1) NOT NULL DEFAULT 0');
     await ensureIndex(
       'campaign_phones_step_add_idx',
-      'CREATE INDEX `campaign_phones_step_add_idx` ON `campaign_phones` (`step_add`)'
+      'CREATE INDEX `campaign_phones_step_add_idx` ON `campaign_phones` (`step_add`)',
+      'campaign_phones'
     );
     await cleanupBackupTables();
+    await ensurePerformanceIndexes();
   } finally {
-    await sequelize.query('PRAGMA foreign_keys = ON');
+    if (dialect === 'sqlite') {
+      await sequelize.query('PRAGMA foreign_keys = ON');
+      await sequelize.query('PRAGMA journal_mode = WAL');
+      await sequelize.query('PRAGMA busy_timeout = 5000');
+    }
   }
 }
 
+function getModelBag() {
+  return {
+    User,
+    Session,
+    Post,
+    Group,
+    Campaign,
+    CampaignPhone,
+    KeywordFilter,
+    AppSetting,
+    ApiKey,
+    ActivityLog,
+    FilterPost,
+  };
+}
+
 async function initDatabase({ force } = {}) {
+  loadEnv();
   const dataDir = getDataDir();
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
 
-  const markerPath = path.join(dataDir, '.sequelize');
-  const shouldForce = typeof force === 'boolean' ? force : !fs.existsSync(markerPath);
+  const useMysql = isMysqlConfigured();
 
-  if (shouldForce) {
-    removeOldDbFiles();
-  }
+  if (useMysql) {
+    sequelize = createMysqlSequelize();
+    registerModels(sequelize);
+    await sequelize.authenticate();
+    console.log(
+      `MySQL connected: ${getMysqlConfig().host}:${getMysqlConfig().port}/${getMysqlConfig().database}`
+    );
 
-  sequelize = createSequelize();
-  User = defineUser(sequelize);
-  Session = defineSession(sequelize);
-  Post = definePost(sequelize);
-  Group = defineGroup(sequelize);
-  Campaign = defineCampaign(sequelize);
-  CampaignPhone = defineCampaignPhone(sequelize);
-  KeywordFilter = defineKeywordFilter(sequelize);
-  AppSetting = defineAppSetting(sequelize);
-  ApiKey = defineApiKey(sequelize);
-  ActivityLog = defineActivityLog(sequelize);
-  associateModels({
-    User,
-    Session,
-    Post,
-    Group,
-    Campaign,
-    CampaignPhone,
-    KeywordFilter,
-    AppSetting,
-    ApiKey,
-    ActivityLog,
-  });
+    const shouldForce = typeof force === 'boolean' ? force : shouldResetDatabase();
+    await runMigrations({ force: shouldForce });
 
-  await sequelize.authenticate();
-  await safeSync({ force: shouldForce });
-  await seedAdmin(User);
-  await seedSamplePost(Post);
-  await ensurePostKeywordIndex(sequelize);
+    const sqlitePath = getDbPath();
+    await migrateSqliteFileToMysql(getModelBag(), sqlitePath, dataDir);
 
-  if (shouldForce) {
-    fs.writeFileSync(markerPath, new Date().toISOString());
-    console.log('Sequelize tables recreated:', getDbPath());
+    await seedAdmin(User);
+    await seedSamplePost(Post);
+    await ensurePostKeywordIndex(sequelize);
+  } else {
+    const markerPath = path.join(dataDir, '.sequelize');
+    const shouldForce =
+      typeof force === 'boolean' ? force : !fs.existsSync(markerPath);
+
+    if (shouldForce) {
+      removeOldDbFiles();
+    }
+
+    sequelize = createSqliteSequelize();
+    registerModels(sequelize);
+    await sequelize.authenticate();
+    await runMigrations({ force: shouldForce });
+    await seedAdmin(User);
+    await seedSamplePost(Post);
+    await ensurePostKeywordIndex(sequelize);
+
+    if (shouldForce) {
+      fs.writeFileSync(markerPath, new Date().toISOString());
+      console.log('Sequelize tables recreated:', getDbPath());
+    }
   }
 
   return {
     sequelize,
-    User,
-    Session,
-    Post,
-    Group,
-    Campaign,
-    CampaignPhone,
-    KeywordFilter,
-    AppSetting,
-    ApiKey,
-    ActivityLog,
+    ...getModelBag(),
     async close() {
       if (sequelize) {
         await sequelize.close();
@@ -301,7 +474,8 @@ function getModels() {
     !KeywordFilter ||
     !AppSetting ||
     !ApiKey ||
-    !ActivityLog
+    !ActivityLog ||
+    !FilterPost
   ) {
     throw new Error('Database chưa được khởi tạo. Gọi initDatabase() trước.');
   }
@@ -317,6 +491,7 @@ function getModels() {
     AppSetting,
     ApiKey,
     ActivityLog,
+    FilterPost,
   };
 }
 

@@ -20,7 +20,7 @@ function defineApiKey(sequelize) {
         defaultValue: 'API Key',
       },
       key: {
-        type: DataTypes.TEXT,
+        type: DataTypes.STRING(512),
         allowNull: false,
         unique: true,
       },

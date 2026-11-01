@@ -1,4 +1,10 @@
 const { getModels } = require('../models');
+const {
+  scannedDayBucketExpr,
+  scannedMonthBucketExpr,
+  phoneFirstScanDaySubquery,
+  phoneFirstScanMonthSubquery,
+} = require('../utils/statsSql');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAY_WINDOW = 14;
@@ -44,8 +50,11 @@ async function queryBuckets(sequelize, sql) {
 async function homeStats(_req, res, next) {
   try {
     const { sequelize } = getModels();
-    const dayExpr = `date(scanned_at / 1000, 'unixepoch', 'localtime')`;
-    const monthExpr = `strftime('%Y-%m', scanned_at / 1000, 'unixepoch', 'localtime')`;
+    const dialect = sequelize.getDialect();
+    const dayExpr = scannedDayBucketExpr(dialect);
+    const monthExpr = scannedMonthBucketExpr(dialect);
+    const phoneDayInner = phoneFirstScanDaySubquery(dialect);
+    const phoneMonthInner = phoneFirstScanMonthSubquery(dialect);
 
     const [postDays, phoneDays, groupDays, postMonths, phoneMonths, groupMonths] =
       await Promise.all([
@@ -59,20 +68,13 @@ async function homeStats(_req, res, next) {
         queryBuckets(
           sequelize,
           `SELECT bucket, COUNT(*) AS phones
-           FROM (
-             SELECT TRIM(phone) AS phone, date(MIN(scanned_at) / 1000, 'unixepoch', 'localtime') AS bucket
-             FROM posts
-             WHERE scanned_at IS NOT NULL
-               AND phone IS NOT NULL
-               AND TRIM(phone) != ''
-             GROUP BY TRIM(phone)
-           )
+           FROM (${phoneDayInner}) AS phone_by_day
            GROUP BY bucket`
         ),
         queryBuckets(
           sequelize,
-          `SELECT ${dayExpr} AS bucket, COUNT(*) AS groups
-           FROM groups
+          `SELECT ${dayExpr} AS bucket, COUNT(*) AS group_count
+           FROM \`groups\`
            WHERE scanned_at IS NOT NULL
            GROUP BY bucket`
         ),
@@ -86,20 +88,13 @@ async function homeStats(_req, res, next) {
         queryBuckets(
           sequelize,
           `SELECT bucket, COUNT(*) AS phones
-           FROM (
-             SELECT TRIM(phone) AS phone, strftime('%Y-%m', MIN(scanned_at) / 1000, 'unixepoch', 'localtime') AS bucket
-             FROM posts
-             WHERE scanned_at IS NOT NULL
-               AND phone IS NOT NULL
-               AND TRIM(phone) != ''
-             GROUP BY TRIM(phone)
-           )
+           FROM (${phoneMonthInner}) AS phone_by_month
            GROUP BY bucket`
         ),
         queryBuckets(
           sequelize,
-          `SELECT ${monthExpr} AS bucket, COUNT(*) AS groups
-           FROM groups
+          `SELECT ${monthExpr} AS bucket, COUNT(*) AS group_count
+           FROM \`groups\`
            WHERE scanned_at IS NOT NULL
            GROUP BY bucket`
         ),
@@ -107,10 +102,10 @@ async function homeStats(_req, res, next) {
 
     const postDayMap = rowsToMap(postDays, 'posts');
     const phoneDayMap = rowsToMap(phoneDays, 'phones');
-    const groupDayMap = rowsToMap(groupDays, 'groups');
+    const groupDayMap = rowsToMap(groupDays, 'group_count');
     const postMonthMap = rowsToMap(postMonths, 'posts');
     const phoneMonthMap = rowsToMap(phoneMonths, 'phones');
-    const groupMonthMap = rowsToMap(groupMonths, 'groups');
+    const groupMonthMap = rowsToMap(groupMonths, 'group_count');
 
     const now = new Date();
     const today = dayKey(now);

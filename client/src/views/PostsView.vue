@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { Filter, FilterX, Megaphone, RefreshCw, Target } from '@lucide/vue';
 import { api } from '../api';
@@ -34,6 +34,8 @@ const showKeywordFlow = ref(false);
 const keywordPaths = ref([]);
 const keywordExpression = ref('');
 const activeFilterName = ref('');
+const filterSync = ref(null);
+let filterSyncPollTimer = null;
 const pageLimit = ref(100);
 const page = ref(1);
 const total = ref(0);
@@ -303,6 +305,44 @@ const pageNumbers = computed(() => {
   return pages;
 });
 
+const filterSyncLabel = computed(() => {
+  const s = filterSync.value;
+  if (!s || s.status !== 'running') return '';
+  const processed = Number(s.processed) || 0;
+  const matched = Number(s.matched) || 0;
+  const total = Number(s.totalPosts) || 0;
+  if (total > 0) {
+    return `Đang đồng bộ bộ lọc — đã quét ${processed}/${total} bài, khớp ${matched}`;
+  }
+  return `Đang đồng bộ bộ lọc — đã quét ${processed} bài, khớp ${matched}`;
+});
+
+function stopFilterSyncPoll() {
+  if (filterSyncPollTimer) {
+    clearInterval(filterSyncPollTimer);
+    filterSyncPollTimer = null;
+  }
+}
+
+function startFilterSyncPoll() {
+  stopFilterSyncPoll();
+  if (filterSync.value?.status !== 'running') return;
+  const filterId = getActiveFilterId();
+  if (filterId == null) return;
+  filterSyncPollTimer = setInterval(async () => {
+    try {
+      const data = await api(`/api/filters/${filterId}/sync`, { token: token.value });
+      filterSync.value = data.sync || null;
+      if (filterSync.value?.status !== 'running') {
+        stopFilterSyncPoll();
+        await loadPosts();
+      }
+    } catch {
+      stopFilterSyncPoll();
+    }
+  }, 2500);
+}
+
 const rangeLabel = computed(() => {
   const unit = activeTab.value === 'phone' ? 'SĐT' : 'bài';
   if (!total.value) return `0 ${unit}`;
@@ -330,7 +370,10 @@ function buildQuery() {
     params.set('pushedTo', pushedOn.value);
   }
 
-  if (keywordPaths.value.length) {
+  const savedFilterId = getActiveFilterId();
+  if (savedFilterId != null) {
+    params.set('filterId', String(savedFilterId));
+  } else if (keywordPaths.value.length) {
     params.set('paths', JSON.stringify(keywordPaths.value));
   }
 
@@ -377,6 +420,9 @@ async function loadPosts() {
       await loadPosts();
       return;
     }
+
+    filterSync.value = data.filterSync || null;
+    startFilterSyncPoll();
 
     selectedPostIds.value = [];
     selectedPhones.value = [];
@@ -797,7 +843,10 @@ function buildPostLinksQuery() {
     params.set('pushedFrom', pushedOn.value);
     params.set('pushedTo', pushedOn.value);
   }
-  if (keywordPaths.value.length) {
+  const savedFilterId = getActiveFilterId();
+  if (savedFilterId != null) {
+    params.set('filterId', String(savedFilterId));
+  } else if (keywordPaths.value.length) {
     params.set('paths', JSON.stringify(keywordPaths.value));
   }
   if (hasCampaignFilter.value) {
@@ -894,6 +943,10 @@ onMounted(() => {
   loadSavedKeywordFilter().finally(() => {
     loadPosts();
   });
+});
+
+onUnmounted(() => {
+  stopFilterSyncPoll();
 });
 </script>
 
@@ -1083,6 +1136,16 @@ onMounted(() => {
     </div>
 
     <div v-if="error" class="alert alert--error">{{ error }}</div>
+
+    <div
+      v-if="filterSyncLabel"
+      class="alert alert--ok filter-sync-banner"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="spinner spinner--sm" aria-hidden="true" />
+      {{ filterSyncLabel }}
+    </div>
 
     <div class="panel-loading-wrap" :class="{ 'is-loading': loading }">
       <LoadingState v-if="loading" :overlay="!!(activeTab === 'phone' ? phoneGroups.length : posts.length)" />

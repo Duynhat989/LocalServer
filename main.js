@@ -1,3 +1,5 @@
+require('./utils/loadEnv').loadEnv();
+
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 

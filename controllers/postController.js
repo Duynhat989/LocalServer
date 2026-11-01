@@ -1,6 +1,12 @@
 const { Op, fn, col, literal } = require('sequelize');
 const { getModels } = require('../models');
 const { toPublicPost, normalizePostInput } = require('../utils/post');
+const {
+  keywordPathsWhere,
+  isFtsResultCacheError,
+  resolveKeywordMatch,
+} = require('../utils/postKeywordSearch');
+const { queueAttachPosts, getFilterSyncPublic } = require('../jobs/filterPostsSync');
 const { toKeyword } = require('../utils/text');
 
 const ALLOWED_LIMITS = [50, 100, 200, 500, 1000, 10000];
@@ -63,50 +69,6 @@ function parsePaths(raw) {
   }
 }
 
-function ftsPhrase(needle) {
-  return `"${String(needle).replace(/"/g, '""')}"`;
-}
-
-function keywordPathsWhere(paths) {
-  const { sequelize } = getModels();
-  const groups = [];
-
-  for (const path of paths) {
-    const include = Array.isArray(path) ? path : path.include || [];
-    const exclude = Array.isArray(path) ? [] : path.exclude || [];
-    const phrases = [];
-    const scans = [];
-    for (const needle of include) {
-      if (!needle) continue;
-      if (needle.length >= 3) phrases.push(ftsPhrase(needle));
-      else scans.push(`instr(IFNULL(keyword, ''), ${sequelize.escape(needle)}) > 0`);
-    }
-
-    const and = [];
-    if (phrases.length) {
-      const match = phrases.length === 1 ? phrases[0] : `(${phrases.join(' AND ')})`;
-      and.push(
-        `id IN (SELECT rowid FROM post_keyword_fts WHERE post_keyword_fts MATCH ${sequelize.escape(match)})`
-      );
-    }
-    and.push(...scans);
-    for (const needle of exclude) {
-      if (!needle) continue;
-      if (needle.length >= 3) {
-        and.push(
-          `id NOT IN (SELECT rowid FROM post_keyword_fts WHERE post_keyword_fts MATCH ${sequelize.escape(ftsPhrase(needle))})`
-        );
-      } else {
-        and.push(`instr(IFNULL(keyword, ''), ${sequelize.escape(needle)}) = 0`);
-      }
-    }
-    if (and.length) groups.push(and.length === 1 ? and[0] : `(${and.join(' AND ')})`);
-  }
-
-  if (!groups.length) return null;
-  return literal(groups.join(' OR '));
-}
-
 function parseDateOnly(value) {
   const raw = String(value || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
@@ -133,8 +95,14 @@ function phoneExactWhere(phoneExact) {
   return { phone: exact };
 }
 
-function buildListWhere(query = {}) {
+function parseFilterId(query = {}) {
+  const id = Number(query.filterId);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+function buildListWhere(query = {}, { keywordMatch = 'fulltext', filterId = null } = {}) {
   const and = [];
+  const savedFilterId = filterId ?? parseFilterId(query);
 
   const phoneExact = String(query.phoneExact || '').trim();
   if (phoneExact) {
@@ -183,8 +151,18 @@ function buildListWhere(query = {}) {
   }
 
   const paths = parsePaths(query.paths);
-  if (paths.length) {
-    const keywordWhere = keywordPathsWhere(paths);
+  if (savedFilterId) {
+    const { sequelize } = getModels();
+    and.push({
+      id: {
+        [Op.in]: literal(
+          `(SELECT post_id FROM filter_posts WHERE filter_id = ${sequelize.escape(savedFilterId)})`
+        ),
+      },
+    });
+  } else if (paths.length) {
+    const { sequelize } = getModels();
+    const keywordWhere = keywordPathsWhere(paths, sequelize, keywordMatch);
     if (keywordWhere) and.push(keywordWhere);
   }
 
@@ -349,21 +327,83 @@ async function listDistinctUserNames(Post, where) {
     .sort((a, b) => a.localeCompare(b, 'vi'));
 }
 
+async function assembleListWhere(query, keywordMatch, filterId = null) {
+  const { campaignId, membership } = parseCampaignMembership(query);
+  return applyCampaignMembershipWhere(
+    buildListWhere(query, { keywordMatch, filterId }),
+    campaignId,
+    membership
+  );
+}
+
+async function fetchPostsListPayload(Post, req, where, limit, offset, view, keywordMatch) {
+  const { campaignId, membership } = parseCampaignMembership(req.query);
+
+  if (view === 'phone') {
+    const [total, matchedPostCount, phoneGroups] = await Promise.all([
+      countDistinctPhones(Post, where),
+      Post.count({ where }),
+      listPhoneGroupsPage(Post, where, limit, offset),
+    ]);
+    return {
+      view: 'phone',
+      posts: phoneGroups.flatMap((g) => g.posts),
+      phoneGroups,
+      total,
+      matchedPostCount,
+    };
+  }
+
+  const phoneExact = String(req.query.phoneExact || '').trim();
+  const includeUserNames = Boolean(phoneExact) || req.query.includeUserNames === '1';
+
+  const order = [
+    ['createdTime', 'DESC'],
+    ['id', 'DESC'],
+  ];
+  const rowsPromise = Post.findAll({ where, order, limit, offset });
+  const countPromise = Post.count({ where });
+  const resultPromise = Promise.all([rowsPromise, countPromise]).then(([rows, count]) => ({
+    rows,
+    count,
+  }));
+
+  let userNamesPromise = Promise.resolve(undefined);
+  if (includeUserNames) {
+    userNamesPromise = (async () => {
+      const nameWhereApplied = await assembleListWhere(
+        { ...req.query, userName: '' },
+        keywordMatch
+      );
+      return listDistinctUserNames(Post, nameWhereApplied.where);
+    })();
+  }
+
+  const [result, userNames] = await Promise.all([resultPromise, userNamesPromise]);
+  return {
+    view: 'post',
+    posts: result.rows.map(toPublicPost),
+    total: result.count,
+    matchedPostCount: result.count,
+    userNames,
+  };
+}
+
 async function listPosts(req, res, next) {
   try {
     const { Post } = getModels();
     const { limit, offset } = parsePagination(req.query);
-    let where = buildListWhere(req.query);
     const view = String(req.query.view || 'post').toLowerCase() === 'phone' ? 'phone' : 'post';
     const { campaignId, membership } = parseCampaignMembership(req.query);
 
-    const campaignApplied = await applyCampaignMembershipWhere(
-      where,
-      campaignId,
-      membership
-    );
-    where = campaignApplied.where;
-    const campaignPhoneCount = campaignApplied.campaignPhoneCount;
+    const { sequelize } = getModels();
+    const savedFilterId = parseFilterId(req.query);
+    const filterPaths = savedFilterId ? [] : parsePaths(req.query.paths);
+    let keywordMatch = savedFilterId
+      ? 'fulltext'
+      : resolveKeywordMatch(filterPaths, req.query, sequelize.getDialect());
+    let campaignApplied = await assembleListWhere(req.query, keywordMatch, savedFilterId);
+    let where = campaignApplied.where;
 
     const filterMeta = {
       phone: String(req.query.phone || '').trim() || null,
@@ -375,72 +415,52 @@ async function listPosts(req, res, next) {
       paths: parsePaths(req.query.paths),
       campaignId,
       campaignMembership: membership || null,
-      campaignPhoneCount,
+      campaignPhoneCount: campaignApplied.campaignPhoneCount,
+      filterId: savedFilterId,
     };
 
-    if (view === 'phone') {
-      const [total, matchedPostCount, phoneGroups] = await Promise.all([
-        countDistinctPhones(Post, where),
-        Post.count({ where }),
-        listPhoneGroupsPage(Post, where, limit, offset),
-      ]);
+    let filterSync = null;
+    if (savedFilterId) {
+      filterSync = await getFilterSyncPublic(savedFilterId);
+    }
 
-      return res.json({
-        ok: true,
-        view: 'phone',
-        posts: phoneGroups.flatMap((g) => g.posts),
-        phoneGroups,
-        total,
-        matchedPostCount,
+    let payload;
+    try {
+      payload = await fetchPostsListPayload(
+        Post,
+        req,
+        where,
         limit,
         offset,
-        page: Math.floor(offset / limit) + 1,
-        totalPages: Math.max(1, Math.ceil(total / limit) || 1),
-        filters: filterMeta,
-      });
+        view,
+        keywordMatch
+      );
+    } catch (err) {
+      if (savedFilterId || !isFtsResultCacheError(err)) throw err;
+      console.warn('[posts] FULLTEXT vượt cache — lọc keyword bằng INSTR');
+      keywordMatch = 'substr';
+      campaignApplied = await assembleListWhere(req.query, keywordMatch, savedFilterId);
+      where = campaignApplied.where;
+      payload = await fetchPostsListPayload(
+        Post,
+        req,
+        where,
+        limit,
+        offset,
+        view,
+        keywordMatch
+      );
     }
-
-    const phoneExact = String(req.query.phoneExact || '').trim();
-    const includeUserNames = Boolean(phoneExact) || req.query.includeUserNames === '1';
-
-    const resultPromise = Post.findAndCountAll({
-      where,
-      order: [
-        ['createdTime', 'DESC'],
-        ['id', 'DESC'],
-      ],
-      limit,
-      offset,
-    });
-
-    let userNamesPromise = Promise.resolve(undefined);
-    if (includeUserNames) {
-      // Dropdown ignores userName filter so options stay complete for the phone
-      userNamesPromise = (async () => {
-        const nameWhereBase = buildListWhere({ ...req.query, userName: '' });
-        const nameWhereApplied = await applyCampaignMembershipWhere(
-          nameWhereBase,
-          campaignId,
-          membership
-        );
-        return listDistinctUserNames(Post, nameWhereApplied.where);
-      })();
-    }
-
-    const [result, userNames] = await Promise.all([resultPromise, userNamesPromise]);
 
     res.json({
       ok: true,
-      view: 'post',
-      posts: result.rows.map(toPublicPost),
-      total: result.count,
-      matchedPostCount: result.count,
-      userNames,
+      ...payload,
       limit,
       offset,
       page: Math.floor(offset / limit) + 1,
-      totalPages: Math.max(1, Math.ceil(result.count / limit) || 1),
+      totalPages: Math.max(1, Math.ceil((payload.total || 0) / limit) || 1),
       filters: filterMeta,
+      filterSync,
     });
   } catch (err) {
     next(err);
@@ -458,10 +478,13 @@ async function createPost(req, res) {
     const existed = await Post.findOne({ where: { postId: payload.postId } });
     if (existed) {
       await existed.update(payload);
+      await existed.reload();
+      queueAttachPosts([{ id: existed.id, keyword: existed.keyword }]);
       return res.json({ ok: true, post: toPublicPost(existed), updated: true });
     }
 
     const post = await Post.create(payload);
+    queueAttachPosts([{ id: post.id, keyword: post.keyword }]);
     res.status(201).json({ ok: true, post: toPublicPost(post) });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message || 'Không lưu được post' });
@@ -478,6 +501,7 @@ async function createPostsBulk(req, res) {
     const { Post } = getModels();
     let created = 0;
     let updated = 0;
+    const touchedPostIds = [];
 
     for (const item of items) {
       const payload = normalizePostInput(item);
@@ -485,11 +509,21 @@ async function createPostsBulk(req, res) {
       const existed = await Post.findOne({ where: { postId: payload.postId } });
       if (existed) {
         await existed.update(payload);
+        touchedPostIds.push(existed.id);
         updated += 1;
       } else {
-        await Post.create(payload);
+        const row = await Post.create(payload);
+        touchedPostIds.push(row.id);
         created += 1;
       }
+    }
+
+    if (touchedPostIds.length) {
+      const rows = await Post.findAll({
+        where: { id: touchedPostIds },
+        attributes: ['id', 'keyword'],
+      });
+      queueAttachPosts(rows);
     }
 
     res.json({

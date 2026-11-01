@@ -19,6 +19,15 @@ function toPublicKeywordFilter(row) {
     edges: Array.isArray(edges) ? edges : [],
     created_at: json.created_at || json.createdAt || null,
     updated_at: json.updated_at || json.updatedAt || null,
+    sync: {
+      status: json.syncStatus || json.sync_status || 'idle',
+      generation: Number(json.syncGeneration ?? json.sync_generation) || 0,
+      startedAt: json.syncStartedAt || json.sync_started_at || null,
+      finishedAt: json.syncFinishedAt || json.sync_finished_at || null,
+      processed: Number(json.syncProcessed ?? json.sync_processed) || 0,
+      matched: Number(json.syncMatched ?? json.sync_matched) || 0,
+      error: json.syncError || json.sync_error || null,
+    },
   };
 }
 

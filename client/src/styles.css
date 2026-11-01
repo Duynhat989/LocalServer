@@ -2868,6 +2868,12 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   color: var(--danger);
 }
 
+.filter-sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .alert--ok {
   background: var(--ok-bg);
   color: var(--ok);

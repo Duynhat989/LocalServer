@@ -4,3 +4,4 @@ data/
 native/
 *.log
 .DS_Store
+.env

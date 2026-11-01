@@ -1,7 +1,8 @@
 const FTS_TABLE = 'post_keyword_fts';
 const INDEXED_TABLE = 'post_keyword_indexed';
+const MYSQL_FT_INDEX = 'posts_keyword_fulltext';
 
-async function ensurePostKeywordIndex(sequelize) {
+async function ensureSqlitePostKeywordIndex(sequelize) {
   await sequelize.query(`
     CREATE VIRTUAL TABLE IF NOT EXISTS ${FTS_TABLE} USING fts5(
       keyword,
@@ -71,6 +72,43 @@ async function ensurePostKeywordIndex(sequelize) {
     WHERE i.post_id IS NULL
   `);
   console.log(`Đã đưa ${missing} bài vào bảng tìm kiếm`);
+}
+
+async function mysqlIndexExists(sequelize, indexName) {
+  const [rows] = await sequelize.query(
+    `SELECT 1 AS ok FROM information_schema.statistics
+     WHERE table_schema = DATABASE() AND table_name = 'posts' AND index_name = ?
+     LIMIT 1`,
+    { replacements: [indexName] }
+  );
+  return rows.length > 0;
+}
+
+async function ensureMysqlPostKeywordIndex(sequelize) {
+  if (await mysqlIndexExists(sequelize, MYSQL_FT_INDEX)) {
+    console.log('MySQL FULLTEXT keyword đã có');
+    return;
+  }
+  try {
+    await sequelize.query(
+      `ALTER TABLE posts ADD FULLTEXT INDEX \`${MYSQL_FT_INDEX}\` (\`keyword\`) WITH PARSER ngram`
+    );
+    console.log('Đã tạo FULLTEXT ngram trên posts.keyword');
+  } catch (err) {
+    console.warn('FULLTEXT ngram không khả dụng, dùng FULLTEXT mặc định:', err.message || err);
+    await sequelize.query(
+      `ALTER TABLE posts ADD FULLTEXT INDEX \`${MYSQL_FT_INDEX}\` (\`keyword\`)`
+    );
+    console.log('Đã tạo FULLTEXT trên posts.keyword');
+  }
+}
+
+async function ensurePostKeywordIndex(sequelize) {
+  const dialect = sequelize.getDialect();
+  if (dialect === 'mysql') {
+    return ensureMysqlPostKeywordIndex(sequelize);
+  }
+  return ensureSqlitePostKeywordIndex(sequelize);
 }
 
 module.exports = { ensurePostKeywordIndex };
