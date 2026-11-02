@@ -5,6 +5,8 @@ const { requireAuth, requireStaff } = require('../middleware/auth');
 const router = express.Router();
 
 router.get('/', requireAuth, requireStaff, groupController.listGroups);
+router.get('/stats/post', requireAuth, requireStaff, groupController.getGroupPostStat);
+router.get('/stats/posts-total', requireAuth, requireStaff, groupController.getGroupsPostsTotal);
 router.get('/stats/phone', requireAuth, requireStaff, groupController.getGroupPhoneStat);
 router.get('/stats/phones-total', requireAuth, requireStaff, groupController.getGroupsPhonesTotal);
 router.post('/claim', requireAuth, requireStaff, groupController.claimGroup);

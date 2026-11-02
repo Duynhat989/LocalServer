@@ -70,16 +70,14 @@ function buildGroupListWhere(query = {}) {
   return { [Op.and]: parts };
 }
 
-const GROUP_POST_STATS_SQL = `
-  SELECT
-    group_id AS groupId,
-    COUNT(
-      DISTINCT CASE
-        WHEN instr(post_id, '__') > 0
-          THEN substr(post_id, 1, instr(post_id, '__') - 1)
-        ELSE post_id
-      END
-    ) AS postCount
+const GROUP_POST_COUNT_SQL = `
+  SELECT COUNT(
+    DISTINCT CASE
+      WHEN instr(post_id, '__') > 0
+        THEN substr(post_id, 1, instr(post_id, '__') - 1)
+      ELSE post_id
+    END
+  ) AS postCount
   FROM posts
   WHERE group_id IS NOT NULL AND trim(group_id) != ''
 `;
@@ -93,35 +91,18 @@ const GROUP_PHONE_COUNT_SQL = `
   WHERE group_id IS NOT NULL AND trim(group_id) != ''
 `;
 
-function postStatsRowsToMap(rows) {
-  const map = new Map();
-  for (const row of rows || []) {
-    const key = String(row.groupId || '').trim();
-    if (!key) continue;
-    map.set(key, { postCount: Number(row.postCount) || 0 });
-  }
-  return map;
+async function countPostsForGroupUid(Post, uid) {
+  const key = String(uid || '').trim();
+  if (!key) return 0;
+  const [[row]] = await Post.sequelize.query(`${GROUP_POST_COUNT_SQL} AND group_id = ?`, {
+    replacements: [key],
+  });
+  return Number(row?.postCount) || 0;
 }
 
-async function loadGroupPostStatsForUids(Post, uids) {
-  const keys = [...new Set(uids.map((u) => String(u || '').trim()).filter(Boolean))];
-  if (!keys.length) return new Map();
-
-  const placeholders = keys.map(() => '?').join(', ');
-  const [rows] = await Post.sequelize.query(
-    `${GROUP_POST_STATS_SQL} AND group_id IN (${placeholders}) GROUP BY group_id`,
-    { replacements: keys }
-  );
-  return postStatsRowsToMap(rows);
-}
-
-async function loadGlobalPostTotal(Post) {
-  const [[row]] = await Post.sequelize.query(`
-    SELECT COUNT(*) AS cnt
-    FROM posts
-    WHERE group_id IS NOT NULL AND trim(group_id) != ''
-  `);
-  return Number(row?.cnt) || 0;
+async function loadGlobalDistinctPostTotal(Post) {
+  const [[row]] = await Post.sequelize.query(GROUP_POST_COUNT_SQL);
+  return Number(row?.postCount) || 0;
 }
 
 async function countPhonesForGroupUid(Post, uid) {
@@ -143,6 +124,30 @@ async function loadGlobalDistinctPhoneTotal(Post) {
     WHERE group_id IS NOT NULL AND trim(group_id) != ''
   `);
   return Number(row?.phoneCount) || 0;
+}
+
+async function getGroupPostStat(req, res, next) {
+  try {
+    const uid = String(req.query.uid || '').trim();
+    if (!uid) {
+      return res.status(400).json({ ok: false, error: 'Thiếu uid' });
+    }
+    const { Post } = getModels();
+    const postCount = await countPostsForGroupUid(Post, uid);
+    res.json({ ok: true, uid, postCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getGroupsPostsTotal(req, res, next) {
+  try {
+    const { Post } = getModels();
+    const postCount = await loadGlobalDistinctPostTotal(Post);
+    res.json({ ok: true, postCount });
+  } catch (err) {
+    next(err);
+  }
 }
 
 async function getGroupPhoneStat(req, res, next) {
@@ -171,7 +176,7 @@ async function getGroupsPhonesTotal(req, res, next) {
 
 async function listGroups(req, res, next) {
   try {
-    const { Group, Post } = getModels();
+    const { Group } = getModels();
     const picker = req.query.picker === '1' || req.query.picker === 'true';
     if (picker) {
       const rows = await Group.findAll({
@@ -195,7 +200,7 @@ async function listGroups(req, res, next) {
     const { limit, offset } = parseGroupPagination(req.query);
     const where = buildGroupListWhere(req.query);
 
-    const [rows, total, totalAll, totalPosts] = await Promise.all([
+    const [rows, total, totalAll] = await Promise.all([
       Group.findAll({
         where,
         order: [['id', 'DESC']],
@@ -204,17 +209,11 @@ async function listGroups(req, res, next) {
       }),
       Group.count({ where }),
       Group.count(),
-      loadGlobalPostTotal(Post),
     ]);
 
-    const uids = rows.map((row) => String(row.uid || '').trim()).filter(Boolean);
-    const statsMap = await loadGroupPostStatsForUids(Post, uids);
-
-    const groups = rows.map((row) => {
-      const uid = String(row.uid || '').trim();
-      const stats = statsMap.get(uid) || { postCount: 0 };
-      return toPublicGroup(row, { postCount: stats.postCount, phoneCount: null });
-    });
+    const groups = rows.map((row) =>
+      toPublicGroup(row, { postCount: null, phoneCount: null })
+    );
 
     res.json({
       ok: true,
@@ -226,7 +225,7 @@ async function listGroups(req, res, next) {
       page: Math.floor(offset / limit) + 1,
       totalPages: Math.max(1, Math.ceil(total / limit) || 1),
       totals: {
-        posts: totalPosts,
+        posts: null,
         phones: null,
       },
     });
@@ -505,6 +504,8 @@ async function deleteGroup(req, res) {
 
 module.exports = {
   listGroups,
+  getGroupPostStat,
+  getGroupsPostsTotal,
   getGroupPhoneStat,
   getGroupsPhonesTotal,
   createGroup,

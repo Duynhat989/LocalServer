@@ -253,8 +253,8 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   user-select: none;
 }
 
-.phone-count-cell__loading,
-.groups-summary__phones {
+.stat-count-cell__loading,
+.groups-summary__stat {
   display: inline-flex;
   align-items: center;
   gap: 6px;

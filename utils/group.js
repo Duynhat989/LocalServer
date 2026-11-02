@@ -26,12 +26,14 @@ function toPublicGroup(group, stats = null) {
     status === 'pending' ||
     (status === 'done' && (availableAt == null || Number(availableAt) <= now));
 
-  const postCount =
-    stats && Number.isFinite(Number(stats.postCount))
-      ? Number(stats.postCount)
-      : typeof json.postCount === 'number'
-        ? json.postCount
-        : 0;
+  let postCount = 0;
+  if (stats && Object.prototype.hasOwnProperty.call(stats, 'postCount') && stats.postCount === null) {
+    postCount = null;
+  } else if (stats && Number.isFinite(Number(stats.postCount))) {
+    postCount = Number(stats.postCount);
+  } else if (typeof json.postCount === 'number') {
+    postCount = json.postCount;
+  }
   let phoneCount = 0;
   if (stats && Object.prototype.hasOwnProperty.call(stats, 'phoneCount') && stats.phoneCount === null) {
     phoneCount = null;
