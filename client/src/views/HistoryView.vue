@@ -178,14 +178,9 @@ onMounted(loadLogs);
 
     <div v-if="error" class="alert alert--error">{{ error }}</div>
 
-    <LoadingState v-if="loading && !logs.length" label="Đang tải lịch sử…" />
+    <LoadingState v-if="loading" block-layout label="Đang tải lịch sử…" />
 
-    <div
-      v-else-if="logs.length"
-      class="panel-loading-wrap table-wrap"
-      :class="{ 'is-loading': loading }"
-    >
-      <LoadingState v-if="loading" overlay label="Đang tải…" />
+    <div v-if="logs.length" class="table-wrap">
       <table class="user-table history-table">
         <thead>
           <tr>

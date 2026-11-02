@@ -73,7 +73,7 @@ async function onLogout() {
         <Suspense>
           <component :is="Component" />
           <template #fallback>
-            <LoadingState />
+            <LoadingState block-layout label="Đang tải trang…" />
           </template>
         </Suspense>
       </router-view>

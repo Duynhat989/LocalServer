@@ -188,14 +188,9 @@ onMounted(async () => {
     <div v-if="actionError" class="alert alert--error">{{ actionError }}</div>
     <div v-if="actionMsg" class="alert alert--ok">{{ actionMsg }}</div>
 
-    <LoadingState v-if="loading && !users.length" label="Đang tải user…" />
+    <LoadingState v-if="loading" block-layout label="Đang tải user…" />
 
-    <div
-      v-else-if="users.length"
-      class="panel-loading-wrap table-wrap"
-      :class="{ 'is-loading': loading }"
-    >
-      <LoadingState v-if="loading" overlay label="Đang tải…" />
+    <div v-if="users.length" class="table-wrap">
       <table class="user-table">
         <thead>
           <tr>

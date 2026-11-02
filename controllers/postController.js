@@ -238,14 +238,6 @@ async function applyCampaignMembershipWhere(where, campaignId, membership) {
   };
 }
 
-function parseUserNamesRaw(raw) {
-  return String(raw || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .sort((a, b) => a.localeCompare(b, 'vi'));
-}
-
 function createdTimeToMs(value) {
   if (!value) return null;
   const t = new Date(value).getTime();
@@ -253,13 +245,51 @@ function createdTimeToMs(value) {
 }
 
 async function countDistinctPhones(Post, where) {
-  const rows = await Post.findAll({
-    attributes: [[literal(PHONE_KEY_SQL), 'phoneKey']],
+  const row = await Post.findOne({
+    attributes: [[literal(`COUNT(DISTINCT ${PHONE_KEY_SQL})`), 'cnt']],
     where,
-    group: [literal(PHONE_KEY_SQL)],
     raw: true,
   });
-  return rows.length;
+  return Number(row?.cnt) || 0;
+}
+
+function whereForPhoneKey(sequelize, phoneKey) {
+  const key = normalizePhoneKey(phoneKey);
+  if (key === EMPTY_PHONE_LABEL) {
+    return {
+      [Op.or]: [{ phone: null }, { phone: '' }, literal("NULLIF(TRIM(`phone`), '') IS NULL")],
+    };
+  }
+  return literal(`${PHONE_KEY_SQL} = ${sequelize.escape(key)}`);
+}
+
+async function attachUserNamesToPhoneGroups(Post, where, groups) {
+  const { sequelize } = Post;
+  if (!groups.length) return groups;
+
+  const keyConditions = groups.map((g) => whereForPhoneKey(sequelize, g.phone));
+  const rows = await Post.findAll({
+    attributes: [
+      [literal(PHONE_KEY_SQL), 'phoneKey'],
+      ['user_name', 'userName'],
+    ],
+    where: andWhere(where, { [Op.or]: keyConditions }),
+    group: [literal(PHONE_KEY_SQL), col('user_name')],
+    raw: true,
+  });
+
+  const byPhone = new Map();
+  for (const row of rows) {
+    const key = normalizePhoneKey(row.phoneKey);
+    if (!byPhone.has(key)) byPhone.set(key, []);
+    const name = String(row.userName || '').trim();
+    if (name) byPhone.get(key).push(name);
+  }
+
+  return groups.map((group) => ({
+    ...group,
+    userNames: (byPhone.get(group.phone) || []).sort((a, b) => a.localeCompare(b, 'vi')),
+  }));
 }
 
 async function listPhoneGroupsPage(Post, where, limit, offset) {
@@ -270,7 +300,6 @@ async function listPhoneGroupsPage(Post, where, limit, offset) {
       [fn('MAX', col('scanned_at')), 'latestScannedAt'],
       [fn('MAX', col('created_time')), 'latestCreatedTime'],
       [fn('MIN', col('id')), 'sampleId'],
-      [fn('GROUP_CONCAT', literal('DISTINCT user_name')), 'userNamesRaw'],
     ],
     where,
     group: [literal(PHONE_KEY_SQL)],
@@ -297,12 +326,12 @@ async function listPhoneGroupsPage(Post, where, limit, offset) {
     }
   }
 
-  return rows.map((row) => {
+  const groups = rows.map((row) => {
     const samplePost = sampleMap.get(Number(row.sampleId)) || null;
     return {
       phone: normalizePhoneKey(row.phone),
       count: Number(row.count) || 0,
-      userNames: parseUserNamesRaw(row.userNamesRaw),
+      userNames: [],
       latestTime: createdTimeToMs(row.latestCreatedTime),
       latestScannedAt:
         row.latestScannedAt != null && row.latestScannedAt !== ''
@@ -312,6 +341,8 @@ async function listPhoneGroupsPage(Post, where, limit, offset) {
       posts: samplePost ? [samplePost] : [],
     };
   });
+
+  return attachUserNamesToPhoneGroups(Post, where, groups);
 }
 
 async function listDistinctUserNames(Post, where) {
@@ -336,22 +367,60 @@ async function assembleListWhere(query, keywordMatch, filterId = null) {
   );
 }
 
-async function fetchPostsListPayload(Post, req, where, limit, offset, view, keywordMatch) {
+function parseLoadPhase(query = {}) {
+  const raw = String(query.loadPhase || 'all').trim().toLowerCase();
+  if (raw === 'content' || raw === 'stats') return raw;
+  return 'all';
+}
+
+async function fetchPostsListPayload(
+  Post,
+  req,
+  where,
+  limit,
+  offset,
+  view,
+  keywordMatch,
+  loadPhase = 'all'
+) {
   const { campaignId, membership } = parseCampaignMembership(req.query);
 
   if (view === 'phone') {
-    const [total, matchedPostCount, phoneGroups] = await Promise.all([
-      countDistinctPhones(Post, where),
-      Post.count({ where }),
-      listPhoneGroupsPage(Post, where, limit, offset),
-    ]);
-    return {
+    if (loadPhase === 'stats') {
+      const [total, matchedPostCount] = await Promise.all([
+        countDistinctPhones(Post, where),
+        Post.count({ where }),
+      ]);
+      return {
+        view: 'phone',
+        total,
+        matchedPostCount,
+        loadPhase: 'stats',
+      };
+    }
+
+    const phoneGroups = await listPhoneGroupsPage(Post, where, limit, offset);
+    const base = {
       view: 'phone',
       posts: phoneGroups.flatMap((g) => g.posts),
       phoneGroups,
-      total,
-      matchedPostCount,
+      loadPhase: loadPhase === 'content' ? 'content' : 'all',
     };
+
+    if (loadPhase === 'content') {
+      return {
+        ...base,
+        total: null,
+        matchedPostCount: null,
+        statsPending: true,
+      };
+    }
+
+    const [total, matchedPostCount] = await Promise.all([
+      countDistinctPhones(Post, where),
+      Post.count({ where }),
+    ]);
+    return { ...base, total, matchedPostCount };
   }
 
   const phoneExact = String(req.query.phoneExact || '').trim();
@@ -394,6 +463,7 @@ async function listPosts(req, res, next) {
     const { Post } = getModels();
     const { limit, offset } = parsePagination(req.query);
     const view = String(req.query.view || 'post').toLowerCase() === 'phone' ? 'phone' : 'post';
+    const loadPhase = parseLoadPhase(req.query);
     const { campaignId, membership } = parseCampaignMembership(req.query);
 
     const { sequelize } = getModels();
@@ -433,7 +503,8 @@ async function listPosts(req, res, next) {
         limit,
         offset,
         view,
-        keywordMatch
+        keywordMatch,
+        loadPhase
       );
     } catch (err) {
       if (savedFilterId || !isFtsResultCacheError(err)) throw err;
@@ -448,9 +519,15 @@ async function listPosts(req, res, next) {
         limit,
         offset,
         view,
-        keywordMatch
+        keywordMatch,
+        loadPhase
       );
     }
+
+    const totalForPages =
+      payload.total != null && payload.total !== ''
+        ? Number(payload.total) || 0
+        : null;
 
     res.json({
       ok: true,
@@ -458,7 +535,10 @@ async function listPosts(req, res, next) {
       limit,
       offset,
       page: Math.floor(offset / limit) + 1,
-      totalPages: Math.max(1, Math.ceil((payload.total || 0) / limit) || 1),
+      totalPages:
+        totalForPages != null
+          ? Math.max(1, Math.ceil(totalForPages / limit) || 1)
+          : null,
       filters: filterMeta,
       filterSync,
     });

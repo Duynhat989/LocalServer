@@ -6,6 +6,8 @@ import { confirmDialog } from '../composables/useDialog';
 import { useAuth } from '../composables/useAuth';
 import LoadingState from '../components/LoadingState.vue';
 
+const PAGE_LIMIT_OPTIONS = [20, 50, 100, 200];
+
 const STATUS_OPTIONS = [
   { value: 'pending', label: 'Chờ quét' },
   { value: 'active', label: 'Đang claim' },
@@ -16,6 +18,8 @@ const STATUS_OPTIONS = [
 
 const { token, isStaff } = useAuth();
 const groups = ref([]);
+const total = ref(0);
+const totalAll = ref(0);
 const totals = ref({ posts: 0, phones: 0 });
 const loading = ref(true);
 const error = ref('');
@@ -26,6 +30,8 @@ const scannedTo = ref('');
 const actionMsg = ref('');
 const actionError = ref('');
 const busyId = ref(null);
+const page = ref(1);
+const pageLimit = ref(20);
 
 const scanSettings = reactive({
   groupCooldownValue: 1,
@@ -127,56 +133,109 @@ const hasListFilter = computed(
     Boolean(scannedTo.value)
 );
 
-const filteredGroups = computed(() => {
-  const q = String(searchQuery.value || '')
-    .trim()
-    .toLowerCase();
-  const status = statusFilter.value;
-  const fromMs = scannedFrom.value ? dayStartMs(scannedFrom.value) : null;
-  const toMs = scannedTo.value ? dayEndMs(scannedTo.value) : null;
+const totalPages = computed(() =>
+  Math.max(1, Math.ceil((total.value || 0) / pageLimit.value) || 1)
+);
 
-  return groups.value.filter((g) => {
-    if (status && g.status !== status) return false;
-    if (fromMs != null || toMs != null) {
-      const ms = scannedAtMs(g.scannedAt);
-      if (ms == null) return false;
-      if (fromMs != null && ms < fromMs) return false;
-      if (toMs != null && ms > toMs) return false;
-    }
-    if (!q) return true;
-    const hay = [
-      g.uid,
-      g.name,
-      g.link,
-      g.status,
-      g.note,
-      g.claimedBy,
-      statusLabel(g.status),
-      claimLabel(g),
-    ]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase();
-    return hay.includes(q);
-  });
+const pageNumbers = computed(() => {
+  const current = page.value;
+  const last = totalPages.value;
+  const windowSize = 5;
+  let start = Math.max(1, current - Math.floor(windowSize / 2));
+  let end = Math.min(last, start + windowSize - 1);
+  start = Math.max(1, end - windowSize + 1);
+  const pages = [];
+  for (let i = start; i <= end; i += 1) pages.push(i);
+  return pages;
 });
 
+const rangeLabel = computed(() => {
+  if (!total.value) return `0 nhóm · ${totals.value.posts} bài · ${totals.value.phones} SĐT`;
+  const from = (page.value - 1) * pageLimit.value + 1;
+  const to = Math.min(page.value * pageLimit.value, total.value);
+  let text = `${from}–${to} / ${total.value} nhóm`;
+  if (hasListFilter.value && totalAll.value > total.value) {
+    text += ` · lọc từ ${totalAll.value}`;
+  }
+  text += ` · ${totals.value.posts} bài · ${totals.value.phones} SĐT`;
+  return text;
+});
+
+function goToPage(next) {
+  const target = Math.min(Math.max(1, next), totalPages.value);
+  if (target === page.value) return;
+  page.value = target;
+}
+
+let loadSeq = 0;
+let searchDebounceTimer = null;
+
+function buildGroupsQuery() {
+  const params = new URLSearchParams();
+  params.set('limit', String(pageLimit.value));
+  params.set('offset', String((page.value - 1) * pageLimit.value));
+  const q = String(searchQuery.value || '').trim();
+  if (q) params.set('q', q);
+  if (statusFilter.value) params.set('status', statusFilter.value);
+  if (scannedFrom.value) params.set('scannedFrom', scannedFrom.value);
+  if (scannedTo.value) params.set('scannedTo', scannedTo.value);
+  return params.toString();
+}
+
+function scheduleLoadGroups(resetPage = false) {
+  if (resetPage && page.value !== 1) {
+    page.value = 1;
+    return;
+  }
+  loadGroups();
+}
+
 async function loadGroups() {
+  const seq = ++loadSeq;
   loading.value = true;
   error.value = '';
   try {
-    const data = await api('/api/groups', { token: token.value });
+    const data = await api(`/api/groups?${buildGroupsQuery()}`, { token: token.value });
+    if (seq !== loadSeq) return;
+
     groups.value = data.groups || [];
+    total.value = Number(data.total) || 0;
+    totalAll.value = Number(data.totalAll) || total.value;
     totals.value = {
       posts: Number(data.totals?.posts) || 0,
       phones: Number(data.totals?.phones) || 0,
     };
+
+    if (data.limit && PAGE_LIMIT_OPTIONS.includes(Number(data.limit))) {
+      pageLimit.value = Number(data.limit);
+    }
+
+    const maxPage = Math.max(1, Math.ceil(total.value / pageLimit.value) || 1);
+    if (page.value > maxPage) {
+      page.value = maxPage;
+      loading.value = false;
+      await loadGroups();
+    }
   } catch (err) {
+    if (seq !== loadSeq) return;
     error.value = err.message || 'Không tải được nhóm';
   } finally {
-    loading.value = false;
+    if (seq === loadSeq) loading.value = false;
   }
 }
+
+watch([statusFilter, scannedFrom, scannedTo, pageLimit], () => {
+  scheduleLoadGroups(true);
+});
+
+watch(page, () => {
+  loadGroups();
+});
+
+watch(searchQuery, () => {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => scheduleLoadGroups(true), 350);
+});
 
 async function loadScanSettings() {
   settingsError.value = '';
@@ -239,11 +298,7 @@ async function onCreateGroup() {
         note: createForm.note.trim(),
       },
     });
-    if (data.group) {
-      groups.value = [data.group, ...groups.value.filter((g) => g.id !== data.group.id)];
-    } else {
-      await loadGroups();
-    }
+    await loadGroups();
     createOk.value = 'Đã thêm nhóm';
     setTimeout(() => {
       showCreateModal.value = false;
@@ -363,13 +418,9 @@ async function onDeleteGroup() {
       method: 'DELETE',
       token: token.value,
     });
-    groups.value = groups.value.filter((g) => g.id !== group.id);
-    totals.value = {
-      posts: Math.max(0, (totals.value.posts || 0) - count),
-      phones: Math.max(0, (totals.value.phones || 0) - (Number(group.phoneCount) || 0)),
-    };
     deleteGroupBusy.value = false;
     closeDetailModal();
+    await loadGroups();
     actionMsg.value = `Đã xóa nhóm ${name}`;
     actionError.value = '';
   } catch (err) {
@@ -392,11 +443,7 @@ onMounted(async () => {
     <div class="panel-head panel-head--actions">
       <div>
         <h3>Danh sách nhóm</h3>
-        <p>
-          {{ filteredGroups.length }} nhóm
-          <span v-if="hasListFilter"> · lọc từ {{ groups.length }}</span>
-          · {{ totals.posts }} bài · {{ totals.phones }} SĐT
-        </p>
+        <p>{{ rangeLabel }}</p>
       </div>
       <button
         v-if="isStaff"
@@ -501,6 +548,12 @@ onMounted(async () => {
             />
           </div>
         </div>
+        <label class="pf-field">
+          <span class="pf-field__label">Trang</span>
+          <select v-model.number="pageLimit" class="pf-field__control" aria-label="Số nhóm mỗi trang">
+            <option v-for="n in PAGE_LIMIT_OPTIONS" :key="n" :value="n">{{ n }} / trang</option>
+          </select>
+        </label>
       </div>
     </div>
 
@@ -508,14 +561,9 @@ onMounted(async () => {
     <div v-if="actionError" class="alert alert--error">{{ actionError }}</div>
     <div v-if="actionMsg" class="alert alert--ok">{{ actionMsg }}</div>
 
-    <LoadingState v-if="loading && !groups.length" label="Đang tải nhóm…" />
+    <LoadingState v-if="loading" block-layout label="Đang tải nhóm…" />
 
-    <div
-      v-else-if="filteredGroups.length"
-      class="panel-loading-wrap table-wrap"
-      :class="{ 'is-loading': loading }"
-    >
-      <LoadingState v-if="loading" overlay label="Đang tải…" />
+    <div v-if="groups.length" class="table-wrap">
       <table class="user-table">
         <thead>
           <tr>
@@ -533,7 +581,7 @@ onMounted(async () => {
         </thead>
         <tbody>
           <tr
-            v-for="g in filteredGroups"
+            v-for="g in groups"
             :key="g.id"
             class="group-row"
             tabindex="0"
@@ -595,8 +643,64 @@ onMounted(async () => {
       </table>
     </div>
     <p v-else class="empty">
-      {{ groups.length ? 'Không có nhóm khớp bộ lọc.' : 'Chưa có nhóm nào.' }}
+      {{ hasListFilter || totalAll ? 'Không có nhóm khớp bộ lọc.' : 'Chưa có nhóm nào.' }}
     </p>
+
+    <div v-if="total > pageLimit" class="pagination">
+      <button
+        class="btn btn--ghost btn--tiny"
+        type="button"
+        :disabled="loading || page <= 1"
+        @click="goToPage(page - 1)"
+      >
+        Trước
+      </button>
+
+      <button
+        v-if="pageNumbers[0] > 1"
+        class="page-btn"
+        type="button"
+        :disabled="loading"
+        @click="goToPage(1)"
+      >
+        1
+      </button>
+      <span v-if="pageNumbers[0] > 2" class="page-ellipsis">…</span>
+
+      <button
+        v-for="n in pageNumbers"
+        :key="n"
+        class="page-btn"
+        type="button"
+        :class="{ active: n === page }"
+        :disabled="loading"
+        @click="goToPage(n)"
+      >
+        {{ n }}
+      </button>
+
+      <span v-if="pageNumbers[pageNumbers.length - 1] < totalPages - 1" class="page-ellipsis">…</span>
+      <button
+        v-if="pageNumbers[pageNumbers.length - 1] < totalPages"
+        class="page-btn"
+        type="button"
+        :disabled="loading"
+        @click="goToPage(totalPages)"
+      >
+        {{ totalPages }}
+      </button>
+
+      <button
+        class="btn btn--ghost btn--tiny"
+        type="button"
+        :disabled="loading || page >= totalPages"
+        @click="goToPage(page + 1)"
+      >
+        Sau
+      </button>
+
+      <span class="muted page-meta">Trang {{ page }}/{{ totalPages }}</span>
+    </div>
   </section>
 
   <Teleport to="body">

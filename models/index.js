@@ -435,7 +435,11 @@ async function initDatabase({ force } = {}) {
     async function afterSqliteMigrationOrSkip() {
       await seedAdmin(User);
       await seedSamplePost(Post);
-      await ensurePostKeywordIndex(sequelize);
+      try {
+        await ensurePostKeywordIndex(sequelize);
+      } catch (err) {
+        console.warn('[db] FULLTEXT/index keyword:', err.message || err);
+      }
     }
 
     startSqliteToMysqlMigration(getModelBag(), sqlitePath, dataDir, {

@@ -328,11 +328,13 @@ function startSqliteToMysqlMigration(mysqlModels, sqlitePath, dataDir, { onCompl
           console.error('[migrate] onComplete:', hookErr.message || hookErr);
         }
       }
-      throw err;
+      return { skipped: true, reason: 'error', error: err };
     } finally {
       migrationState.running = false;
     }
   })();
+
+  migrationState.promise.catch(() => {});
 
   return migrationState.promise;
 }

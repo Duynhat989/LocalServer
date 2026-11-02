@@ -820,14 +820,9 @@ onMounted(async () => {
 
     <div v-if="error" class="alert alert--error">{{ error }}</div>
 
-    <LoadingState v-if="loading && !campaigns.length" label="Đang tải chiến dịch…" />
+    <LoadingState v-if="loading" block-layout label="Đang tải chiến dịch…" />
 
-    <div
-      v-else
-      class="panel-loading-wrap table-wrap campaign-list-full"
-      :class="{ 'is-loading': loading }"
-    >
-      <LoadingState v-if="loading" overlay label="Đang tải…" />
+    <div class="table-wrap campaign-list-full">
       <table class="user-table">
         <thead>
           <tr>

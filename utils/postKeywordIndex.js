@@ -96,10 +96,17 @@ async function ensureMysqlPostKeywordIndex(sequelize) {
     console.log('Đã tạo FULLTEXT ngram trên posts.keyword');
   } catch (err) {
     console.warn('FULLTEXT ngram không khả dụng, dùng FULLTEXT mặc định:', err.message || err);
-    await sequelize.query(
-      `ALTER TABLE posts ADD FULLTEXT INDEX \`${MYSQL_FT_INDEX}\` (\`keyword\`)`
-    );
-    console.log('Đã tạo FULLTEXT trên posts.keyword');
+    try {
+      await sequelize.query(
+        `ALTER TABLE posts ADD FULLTEXT INDEX \`${MYSQL_FT_INDEX}\` (\`keyword\`)`
+      );
+      console.log('Đã tạo FULLTEXT trên posts.keyword');
+    } catch (err2) {
+      console.warn(
+        'Bỏ qua tạo FULLTEXT (có thể thiếu dung lượng đĩa / bảng posts đầy):',
+        err2.message || err2
+      );
+    }
   }
 }
 

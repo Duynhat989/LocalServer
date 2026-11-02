@@ -224,6 +224,20 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   backdrop-filter: blur(2px);
 }
 
+.loading-state--layout-block {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  min-height: 0;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: rgba(255, 250, 246, 0.82);
+  backdrop-filter: blur(3px);
+  cursor: wait;
+  pointer-events: auto;
+}
+
 .loading-state__label {
   font-size: 0.85rem;
   color: var(--orange-deep);

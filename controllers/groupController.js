@@ -4,26 +4,91 @@ const { toPublicGroup, normalizeGroupInput, GROUP_STATUSES, STOP_REASONS } = req
 const { getScanSettingsRow } = require('./settingsController');
 const { addCooldownMs } = require('../utils/settings');
 
-async function loadGroupPostStats(Post) {
-  const [rows] = await Post.sequelize.query(`
-    SELECT
-      group_id AS groupId,
-      COUNT(
-        DISTINCT CASE
-          WHEN instr(post_id, '__') > 0
-            THEN substr(post_id, 1, instr(post_id, '__') - 1)
-          ELSE post_id
-        END
-      ) AS postCount,
-      COUNT(DISTINCT CASE
-        WHEN phone IS NOT NULL AND trim(phone) != '' THEN trim(phone)
-        ELSE NULL
-      END) AS phoneCount
-    FROM posts
-    WHERE group_id IS NOT NULL AND trim(group_id) != ''
-    GROUP BY group_id
-  `);
+const GROUP_LIST_LIMITS = [20, 50, 100, 200];
 
+function parseGroupPagination(query = {}) {
+  let limit = Number(query.limit);
+  if (!GROUP_LIST_LIMITS.includes(limit)) limit = 20;
+  let offset = Number(query.offset);
+  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+  return { limit, offset: Math.floor(offset) };
+}
+
+function parseDateOnly(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  return raw;
+}
+
+function dayStartMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T00:00:00`).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function dayEndMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T23:59:59.999`).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function escapeLike(value) {
+  return String(value).replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+function buildGroupListWhere(query = {}) {
+  const parts = [];
+  const status = String(query.status || '').trim();
+  if (status) parts.push({ status });
+
+  const q = String(query.q || query.search || '').trim();
+  if (q) {
+    const like = `%${escapeLike(q)}%`;
+    parts.push({
+      [Op.or]: [
+        { uid: { [Op.like]: like } },
+        { name: { [Op.like]: like } },
+        { link: { [Op.like]: like } },
+        { note: { [Op.like]: like } },
+        { claimedBy: { [Op.like]: like } },
+      ],
+    });
+  }
+
+  const from = parseDateOnly(query.scannedFrom);
+  const to = parseDateOnly(query.scannedTo);
+  const fromMs = from ? dayStartMs(from) : null;
+  const toMs = to ? dayEndMs(to) : null;
+  if (fromMs != null || toMs != null) {
+    let scannedAt;
+    if (fromMs != null && toMs != null) scannedAt = { [Op.between]: [fromMs, toMs] };
+    else if (fromMs != null) scannedAt = { [Op.gte]: fromMs };
+    else scannedAt = { [Op.lte]: toMs };
+    parts.push({ scannedAt: { [Op.and]: [{ [Op.ne]: null }, scannedAt] } });
+  }
+
+  if (!parts.length) return {};
+  if (parts.length === 1) return parts[0];
+  return { [Op.and]: parts };
+}
+
+const GROUP_STATS_SQL = `
+  SELECT
+    group_id AS groupId,
+    COUNT(
+      DISTINCT CASE
+        WHEN instr(post_id, '__') > 0
+          THEN substr(post_id, 1, instr(post_id, '__') - 1)
+        ELSE post_id
+      END
+    ) AS postCount,
+    COUNT(DISTINCT CASE
+      WHEN phone IS NOT NULL AND trim(phone) != '' THEN trim(phone)
+      ELSE NULL
+    END) AS phoneCount
+  FROM posts
+  WHERE group_id IS NOT NULL AND trim(group_id) != ''
+`;
+
+function statsRowsToMap(rows) {
   const map = new Map();
   for (const row of rows || []) {
     const key = String(row.groupId || '').trim();
@@ -36,17 +101,73 @@ async function loadGroupPostStats(Post) {
   return map;
 }
 
+async function loadGroupPostStatsForUids(Post, uids) {
+  const keys = [...new Set(uids.map((u) => String(u || '').trim()).filter(Boolean))];
+  if (!keys.length) return new Map();
+
+  const placeholders = keys.map(() => '?').join(', ');
+  const [rows] = await Post.sequelize.query(
+    `${GROUP_STATS_SQL} AND group_id IN (${placeholders}) GROUP BY group_id`,
+    { replacements: keys }
+  );
+  return statsRowsToMap(rows);
+}
+
+async function loadGlobalPostPhoneTotals(Post) {
+  const [rows] = await Post.sequelize.query(`${GROUP_STATS_SQL} GROUP BY group_id`);
+  const map = statsRowsToMap(rows);
+  let posts = 0;
+  let phones = 0;
+  for (const stats of map.values()) {
+    posts += stats.postCount;
+    phones += stats.phoneCount;
+  }
+  return { posts, phones };
+}
+
 async function listGroups(req, res, next) {
   try {
     const { Group, Post } = getModels();
-    const [rows, statsMap] = await Promise.all([
-      Group.findAll({ order: [['id', 'DESC']] }),
-      loadGroupPostStats(Post),
+    const picker = req.query.picker === '1' || req.query.picker === 'true';
+    if (picker) {
+      const rows = await Group.findAll({
+        attributes: ['id', 'uid', 'name'],
+        order: [
+          ['name', 'ASC'],
+          ['uid', 'ASC'],
+        ],
+        limit: 10_000,
+      });
+      return res.json({
+        ok: true,
+        groups: rows.map((row) => ({
+          id: row.id,
+          uid: row.uid,
+          name: row.name || '',
+        })),
+      });
+    }
+
+    const { limit, offset } = parseGroupPagination(req.query);
+    const where = buildGroupListWhere(req.query);
+
+    const [rows, total, totalAll, totals] = await Promise.all([
+      Group.findAll({
+        where,
+        order: [['id', 'DESC']],
+        limit,
+        offset,
+      }),
+      Group.count({ where }),
+      Group.count(),
+      loadGlobalPostPhoneTotals(Post),
     ]);
 
+    const uids = rows.map((row) => String(row.uid || '').trim()).filter(Boolean);
+    const statsMap = await loadGroupPostStatsForUids(Post, uids);
+
     const groups = rows.map((row) => {
-      const publicGroup = toPublicGroup(row);
-      const stats = statsMap.get(String(publicGroup.uid || '').trim()) || {
+      const stats = statsMap.get(String(row.uid || '').trim()) || {
         postCount: 0,
         phoneCount: 0,
       };
@@ -56,10 +177,13 @@ async function listGroups(req, res, next) {
     res.json({
       ok: true,
       groups,
-      totals: {
-        posts: groups.reduce((sum, g) => sum + (g.postCount || 0), 0),
-        phones: groups.reduce((sum, g) => sum + (g.phoneCount || 0), 0),
-      },
+      total,
+      totalAll,
+      limit,
+      offset,
+      page: Math.floor(offset / limit) + 1,
+      totalPages: Math.max(1, Math.ceil(total / limit) || 1),
+      totals,
     });
   } catch (err) {
     next(err);

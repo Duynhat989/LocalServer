@@ -21,6 +21,7 @@ const { token, isStaff } = useAuth();
 const posts = ref([]);
 const serverPhoneGroups = ref(null);
 const loading = ref(true);
+const loadingLabel = ref('');
 const error = ref('');
 const activeTab = ref(route.query.view === 'post' ? 'post' : 'phone');
 const groupFilter = ref(String(route.query.groupId || '').trim());
@@ -394,23 +395,58 @@ function syncRouteQuery() {
   router.replace({ query }).catch(() => {});
 }
 
+function applyPostsListResponse(data, { mergeStats = false } = {}) {
+  if (!mergeStats) {
+    posts.value = data.posts || [];
+    serverPhoneGroups.value =
+      data.view === 'phone' && Array.isArray(data.phoneGroups) ? data.phoneGroups : null;
+  }
+
+  if (data.total != null && data.total !== '') {
+    total.value = Number(data.total) || 0;
+  }
+
+  if (data.limit && LIMIT_OPTIONS.includes(Number(data.limit))) {
+    pageLimit.value = Number(data.limit);
+  }
+
+  filterSync.value = data.filterSync ?? filterSync.value;
+}
+
 async function loadPosts() {
   const seq = ++loadSeq;
   loading.value = true;
+  loadingLabel.value = '';
   error.value = '';
+  const isPhoneView = activeTab.value === 'phone';
   try {
-    const data = await api(`/api/posts?${buildQuery()}`, {
-      token: token.value,
-    });
-    if (seq !== loadSeq) return;
+    const baseQuery = buildQuery();
 
-    posts.value = data.posts || [];
-    total.value = Number(data.total) || 0;
-    serverPhoneGroups.value =
-      data.view === 'phone' && Array.isArray(data.phoneGroups) ? data.phoneGroups : null;
+    if (isPhoneView) {
+      loadingLabel.value = 'Bước 1/2 — đang tải nhóm SĐT…';
+      const content = await api(`/api/posts?${baseQuery}&loadPhase=content`, {
+        token: token.value,
+      });
+      if (seq !== loadSeq) return;
 
-    if (data.limit && LIMIT_OPTIONS.includes(Number(data.limit))) {
-      pageLimit.value = Number(data.limit);
+      applyPostsListResponse(content);
+      loading.value = false;
+      loadingLabel.value = 'Bước 2/2 — đang đếm tổng (≈50%)…';
+
+      const stats = await api(`/api/posts?${baseQuery}&loadPhase=stats`, {
+        token: token.value,
+      });
+      if (seq !== loadSeq) return;
+
+      applyPostsListResponse(stats, { mergeStats: true });
+      loadingLabel.value = '';
+    } else {
+      loadingLabel.value = 'Đang tải bài đăng…';
+      const data = await api(`/api/posts?${baseQuery}`, {
+        token: token.value,
+      });
+      if (seq !== loadSeq) return;
+      applyPostsListResponse(data);
     }
 
     const maxPage = Math.max(1, Math.ceil(total.value / pageLimit.value) || 1);
@@ -421,16 +457,17 @@ async function loadPosts() {
       return;
     }
 
-    filterSync.value = data.filterSync || null;
     startFilterSyncPoll();
-
     selectedPostIds.value = [];
     selectedPhones.value = [];
   } catch (err) {
     if (seq !== loadSeq) return;
     error.value = err.message || 'Không tải được danh sách post';
   } finally {
-    if (seq === loadSeq) loading.value = false;
+    if (seq === loadSeq) {
+      loading.value = false;
+      loadingLabel.value = '';
+    }
   }
 }
 
@@ -562,7 +599,7 @@ function onGroupFilterChange() {
 
 async function loadGroups() {
   try {
-    const data = await api('/api/groups', { token: token.value });
+    const data = await api('/api/groups?picker=1', { token: token.value });
     groups.value = data.groups || [];
   } catch (_) {
     groups.value = [];
@@ -1147,9 +1184,13 @@ onUnmounted(() => {
       {{ filterSyncLabel }}
     </div>
 
-    <div class="panel-loading-wrap" :class="{ 'is-loading': loading }">
-      <LoadingState v-if="loading" :overlay="!!(activeTab === 'phone' ? phoneGroups.length : posts.length)" />
+    <LoadingState
+      v-if="loading || loadingLabel"
+      block-layout
+      :label="loadingLabel || 'Đang tải bài đăng…'"
+    />
 
+    <div class="panel-loading-wrap">
       <template v-if="activeTab === 'phone' ? phoneGroups.length : posts.length">
       <div v-show="activeTab === 'post'" class="table-wrap">
         <table class="user-table posts-table">
