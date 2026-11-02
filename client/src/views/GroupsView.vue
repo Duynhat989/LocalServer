@@ -20,7 +20,8 @@ const { token, isStaff } = useAuth();
 const groups = ref([]);
 const total = ref(0);
 const totalAll = ref(0);
-const totals = ref({ posts: 0, phones: 0 });
+const totals = ref({ posts: 0, phones: null });
+const totalsPhonesLoading = ref(false);
 const loading = ref(true);
 const error = ref('');
 const searchQuery = ref('');
@@ -157,7 +158,7 @@ const rangeLabel = computed(() => {
   if (hasListFilter.value && totalAll.value > total.value) {
     text += ` · lọc từ ${totalAll.value}`;
   }
-  text += ` · ${totals.value.posts} bài · ${totals.value.phones} SĐT`;
+  text += ` · ${totals.value.posts} bài`;
   return text;
 });
 
@@ -168,6 +169,7 @@ function goToPage(next) {
 }
 
 let loadSeq = 0;
+let phoneLoadSeq = 0;
 let searchDebounceTimer = null;
 
 function buildGroupsQuery() {
@@ -190,20 +192,84 @@ function scheduleLoadGroups(resetPage = false) {
   loadGroups();
 }
 
+async function loadGlobalPhonesTotal(parentSeq) {
+  totalsPhonesLoading.value = true;
+  try {
+    const data = await api('/api/groups/stats/phones-total', { token: token.value });
+    if (parentSeq !== phoneLoadSeq) return;
+    totals.value = {
+      ...totals.value,
+      phones: Number(data.phoneCount) || 0,
+    };
+  } catch {
+    if (parentSeq !== phoneLoadSeq) return;
+    totals.value = { ...totals.value, phones: 0 };
+  } finally {
+    if (parentSeq === phoneLoadSeq) totalsPhonesLoading.value = false;
+  }
+}
+
+async function loadPhoneCountsSequential() {
+  const seq = ++phoneLoadSeq;
+  totals.value = { ...totals.value, phones: null };
+  totalsPhonesLoading.value = false;
+
+  for (let i = 0; i < groups.value.length; i += 1) {
+    if (seq !== phoneLoadSeq) return;
+    const g = groups.value[i];
+    if (!g?.uid) continue;
+
+    groups.value[i] = { ...g, phoneLoading: true, phoneCount: null };
+
+    try {
+      const data = await api(
+        `/api/groups/stats/phone?uid=${encodeURIComponent(g.uid)}`,
+        { token: token.value }
+      );
+      if (seq !== phoneLoadSeq) return;
+      const updated = {
+        ...groups.value[i],
+        phoneCount: Number(data.phoneCount) || 0,
+        phoneLoading: false,
+      };
+      groups.value[i] = updated;
+      if (detailGroup.value?.id === updated.id) detailGroup.value = { ...updated };
+    } catch {
+      if (seq !== phoneLoadSeq) return;
+      const updated = {
+        ...groups.value[i],
+        phoneCount: 0,
+        phoneLoading: false,
+      };
+      groups.value[i] = updated;
+      if (detailGroup.value?.id === updated.id) detailGroup.value = { ...updated };
+    }
+  }
+
+  if (seq === phoneLoadSeq) {
+    loadGlobalPhonesTotal(seq);
+  }
+}
+
 async function loadGroups() {
   const seq = ++loadSeq;
+  phoneLoadSeq += 1;
   loading.value = true;
   error.value = '';
   try {
     const data = await api(`/api/groups?${buildGroupsQuery()}`, { token: token.value });
     if (seq !== loadSeq) return;
 
-    groups.value = data.groups || [];
+    groups.value = (data.groups || []).map((g) => ({
+      ...g,
+      phoneCount: g.phoneCount ?? null,
+      phoneLoading: g.phoneCount == null,
+    }));
     total.value = Number(data.total) || 0;
     totalAll.value = Number(data.totalAll) || total.value;
     totals.value = {
       posts: Number(data.totals?.posts) || 0,
-      phones: Number(data.totals?.phones) || 0,
+      phones: data.totals?.phones != null ? Number(data.totals.phones) : null,
     };
 
     if (data.limit && PAGE_LIMIT_OPTIONS.includes(Number(data.limit))) {
@@ -215,7 +281,10 @@ async function loadGroups() {
       page.value = maxPage;
       loading.value = false;
       await loadGroups();
+      return;
     }
+
+    loadPhoneCountsSequential();
   } catch (err) {
     if (seq !== loadSeq) return;
     error.value = err.message || 'Không tải được nhóm';
@@ -443,7 +512,15 @@ onMounted(async () => {
     <div class="panel-head panel-head--actions">
       <div>
         <h3>Danh sách nhóm</h3>
-        <p>{{ rangeLabel }}</p>
+        <p class="groups-summary">
+          {{ rangeLabel }}
+          <span v-if="totalsPhonesLoading || totals.phones == null" class="groups-summary__phones">
+            ·
+            <span class="spinner spinner--sm" aria-hidden="true" />
+            <span class="sr-only">Đang đếm SĐT…</span>
+          </span>
+          <span v-else> · {{ totals.phones }} SĐT</span>
+        </p>
       </div>
       <button
         v-if="isStaff"
@@ -605,13 +682,22 @@ onMounted(async () => {
                 {{ g.postCount || 0 }}
               </RouterLink>
             </td>
-            <td class="mono" @click.stop>
+            <td class="mono phone-count-cell" @click.stop>
+              <span
+                v-if="g.phoneLoading || g.phoneCount == null"
+                class="phone-count-cell__loading"
+                :title="`Đang đếm SĐT nhóm ${g.uid}`"
+              >
+                <span class="spinner spinner--sm" aria-hidden="true" />
+                <span class="sr-only">Đang tải SĐT</span>
+              </span>
               <RouterLink
+                v-else
                 class="table-link"
                 :to="{ name: 'posts', query: { groupId: g.uid, view: 'phone' } }"
                 :title="`Xem SĐT của nhóm ${g.uid}`"
               >
-                {{ g.phoneCount || 0 }}
+                {{ g.phoneCount }}
               </RouterLink>
             </td>
             <td @click.stop>
@@ -743,7 +829,12 @@ onMounted(async () => {
           </div>
           <div>
             <span class="muted">SĐT</span>
-            <p class="mono">{{ detailGroup.phoneCount || 0 }}</p>
+            <p class="mono">
+              <span v-if="detailGroup.phoneLoading || detailGroup.phoneCount == null" class="phone-count-cell__loading">
+                <span class="spinner spinner--sm" aria-hidden="true" />
+              </span>
+              <template v-else>{{ detailGroup.phoneCount }}</template>
+            </p>
           </div>
           <div>
             <span class="muted">Lý do dừng</span>

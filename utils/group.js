@@ -32,12 +32,14 @@ function toPublicGroup(group, stats = null) {
       : typeof json.postCount === 'number'
         ? json.postCount
         : 0;
-  const phoneCount =
-    stats && Number.isFinite(Number(stats.phoneCount))
-      ? Number(stats.phoneCount)
-      : typeof json.phoneCount === 'number'
-        ? json.phoneCount
-        : 0;
+  let phoneCount = 0;
+  if (stats && Object.prototype.hasOwnProperty.call(stats, 'phoneCount') && stats.phoneCount === null) {
+    phoneCount = null;
+  } else if (stats && Number.isFinite(Number(stats.phoneCount))) {
+    phoneCount = Number(stats.phoneCount);
+  } else if (typeof json.phoneCount === 'number') {
+    phoneCount = json.phoneCount;
+  }
 
   return {
     id: json.id,
