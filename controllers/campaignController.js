@@ -9,6 +9,7 @@ const {
   normalizePhone,
   generateStepAdd,
 } = require('../utils/campaign');
+const { toPublicPost } = require('../utils/post');
 
 const PHONE_LIMIT_DEFAULT = 100;
 const PHONE_LIMIT_MAX = 10000;
@@ -205,6 +206,15 @@ async function listCampaignPhones(req, res, next) {
   }
 }
 
+function stepBatchSortMs(createdAt) {
+  if (!createdAt) return 0;
+  const raw = String(createdAt).includes('T')
+    ? createdAt
+    : String(createdAt).replace(' ', 'T');
+  const t = new Date(raw).getTime();
+  return Number.isNaN(t) ? 0 : t;
+}
+
 async function listCampaignSteps(req, res, next) {
   try {
     const campaignId = Number(req.params.id);
@@ -220,7 +230,13 @@ async function listCampaignSteps(req, res, next) {
 
     const rows = await CampaignPhone.findAll({
       where: { campaignId },
-      attributes: ['phone', 'userName', 'stepAdd', 'created_at'],
+      attributes: [
+        'id',
+        'phone',
+        'userName',
+        'stepAdd',
+        [col('created_at'), 'createdAt'],
+      ],
       order: [['id', 'DESC']],
     });
 
@@ -234,7 +250,8 @@ async function listCampaignSteps(req, res, next) {
           stepAdd,
           label,
           count: 0,
-          createdAt: json.created_at || json.createdAt || null,
+          createdAt: json.createdAt || json.created_at || null,
+          maxId: 0,
           phones: [],
           userNames: new Set(),
         });
@@ -242,12 +259,18 @@ async function listCampaignSteps(req, res, next) {
       const batch = map.get(label);
       batch.count += 1;
       batch.phones.push(json.phone);
+      const rowId = Number(json.id) || 0;
+      if (rowId > batch.maxId) batch.maxId = rowId;
       if (json.userName || json.user_name) {
         batch.userNames.add(json.userName || json.user_name);
       }
-      const createdAt = json.created_at || json.createdAt || null;
-      if (createdAt && (!batch.createdAt || String(createdAt) > String(batch.createdAt))) {
-        batch.createdAt = createdAt;
+      const createdAt = json.createdAt || json.created_at || null;
+      if (createdAt) {
+        const batchMs = stepBatchSortMs(batch.createdAt);
+        const rowMs = stepBatchSortMs(createdAt);
+        if (!batchMs || rowMs > batchMs) {
+          batch.createdAt = createdAt;
+        }
       }
     }
 
@@ -257,11 +280,17 @@ async function listCampaignSteps(req, res, next) {
         label: batch.label,
         count: batch.count,
         createdAt: batch.createdAt,
+        maxId: batch.maxId,
         userNames: Array.from(batch.userNames),
         previewPhones: batch.phones.slice(0, 5),
         canUndo: Boolean(batch.stepAdd),
       }))
-      .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+      .sort((a, b) => {
+        const byTime = stepBatchSortMs(b.createdAt) - stepBatchSortMs(a.createdAt);
+        if (byTime !== 0) return byTime;
+        return (b.maxId || 0) - (a.maxId || 0);
+      })
+      .map(({ maxId, ...rest }) => rest);
 
     res.json({ ok: true, steps });
   } catch (err) {
@@ -314,6 +343,60 @@ async function updateCampaign(req, res) {
   }
 }
 
+function pickFilled(current, fallback) {
+  const a = current != null ? String(current).trim() : '';
+  if (a) return current;
+  const b = fallback != null ? String(fallback).trim() : '';
+  return b || null;
+}
+
+async function findLatestPostForPhone(Post, phone) {
+  const normalized = normalizePhone(phone);
+  const candidates = [...new Set([String(phone || '').trim(), normalized].filter(Boolean))];
+  if (!candidates.length) return null;
+
+  return Post.findOne({
+    where: { phone: { [Op.in]: candidates } },
+    order: [
+      ['scannedAt', 'DESC'],
+      ['id', 'DESC'],
+    ],
+  });
+}
+
+/** Bổ sung link bài, nhóm, tên FB từ bài mới nhất nếu client gửi thiếu (vd. tab SĐT load tách). */
+async function enrichCampaignItemFromPost(Post, item) {
+  const hasLink = Boolean(pickFilled(item.postUrl, null));
+  const hasUser = Boolean(pickFilled(item.userName, null));
+  const hasGroup = Boolean(pickFilled(item.groupName, null) || pickFilled(item.groupId, null));
+  if (hasLink && hasUser && hasGroup) return item;
+
+  const post = await findLatestPostForPhone(Post, item.phone);
+  if (!post) return item;
+
+  const p = toPublicPost(post);
+  return {
+    ...item,
+    postId: pickFilled(item.postId, p.postId),
+    postMessage: item.postMessage != null && String(item.postMessage).trim()
+      ? item.postMessage
+      : p.postMessage,
+    postUrl: pickFilled(item.postUrl, p.postUrl),
+    groupId: pickFilled(item.groupId, p.groupId),
+    groupName: pickFilled(item.groupName, p.groupName),
+    fbUserId: pickFilled(item.fbUserId, p.userId),
+    userName: pickFilled(item.userName, p.userName),
+    userUrl: pickFilled(item.userUrl, p.userUrl),
+    thesame: pickFilled(item.thesame, p.thesame),
+    createdTime: pickFilled(item.createdTime, p.created_time),
+    scannedAt:
+      item.scannedAt != null && Number.isFinite(Number(item.scannedAt))
+        ? item.scannedAt
+        : p.scannedAt,
+    keyword: pickFilled(item.keyword, p.keyword),
+  };
+}
+
 async function addPhones(req, res) {
   try {
     const id = Number(req.params.id);
@@ -326,7 +409,7 @@ async function addPhones(req, res) {
       return res.status(400).json({ ok: false, error: 'Thiếu số điện thoại' });
     }
 
-    const { Campaign, CampaignPhone } = getModels();
+    const { Campaign, CampaignPhone, Post } = getModels();
     const campaign = await Campaign.findByPk(id);
     if (!campaign) {
       return res.status(404).json({ ok: false, error: 'Không tìm thấy chiến dịch' });
@@ -337,7 +420,8 @@ async function addPhones(req, res) {
     const duplicates = [];
     const created = [];
 
-    for (const item of items) {
+    for (const rawItem of items) {
+      const item = await enrichCampaignItemFromPost(Post, rawItem);
       const existed = await CampaignPhone.findOne({
         where: { campaignId: id, phone: item.phone },
       });

@@ -459,11 +459,14 @@ async function loadPhoneRowDetailsSequential(parentSeq) {
       );
       if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
       const row = data.phoneRow || {};
+      const samplePost = row.samplePost || null;
       patchPhoneGroup(g.phone, {
         count: Number(row.count) || 0,
         userNames: Array.isArray(row.userNames) ? row.userNames : [],
         countLoading: false,
         userNamesLoading: false,
+        samplePost,
+        posts: samplePost ? [samplePost] : [],
       });
     } catch {
       if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
@@ -869,16 +872,42 @@ function closeCampaignModal() {
   pushError.value = '';
 }
 
+async function ensurePostBodiesForCampaignItems(items) {
+  const needIds = [];
+  for (const post of posts.value) {
+    if (!post?.id || !post.bodyLoading) continue;
+    const phone = normalizePhone(post.phone);
+    if (!phone) continue;
+    if (items.some((it) => normalizePhone(it.phone) === phone)) {
+      needIds.push(post.id);
+    }
+  }
+  if (!needIds.length) return;
+  try {
+    const data = await api(`/api/posts?loadPhase=bodies&ids=${needIds.join(',')}`, {
+      token: token.value,
+    });
+    applyPostBodies(data.bodies);
+  } catch {
+    /* server sẽ bổ sung khi thêm CD */
+  }
+}
+
 async function pushToCampaign() {
   const campaignId = Number(selectedCampaignId.value);
   if (!Number.isFinite(campaignId)) {
     pushError.value = 'Chọn chiến dịch';
     return;
   }
-  const items = selectedCampaignItems.value;
+  let items = selectedCampaignItems.value;
   if (!items.length) {
     pushError.value = 'Không có SĐT hợp lệ';
     return;
+  }
+
+  if (activeTab.value === 'post') {
+    await ensurePostBodiesForCampaignItems(items);
+    items = buildSelectedCampaignItems();
   }
 
   pushBusy.value = true;

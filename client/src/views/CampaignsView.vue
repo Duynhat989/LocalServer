@@ -506,7 +506,11 @@ async function loadCampaignSteps() {
     const data = await api(`/api/campaigns/${detail.value.id}/steps`, {
       token: token.value,
     });
-    stepBatches.value = data.steps || [];
+    stepBatches.value = (data.steps || []).slice().sort((a, b) => {
+      const ta = new Date(a.createdAt || 0).getTime();
+      const tb = new Date(b.createdAt || 0).getTime();
+      return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta);
+    });
   } catch (err) {
     actionError.value = err.message || 'Không tải được lịch sử thêm';
     stepBatches.value = [];

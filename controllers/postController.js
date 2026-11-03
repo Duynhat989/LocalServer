@@ -431,10 +431,21 @@ async function fetchPhoneRowDetail(Post, where, phoneKey) {
   const [withNames] = await attachUserNamesToPhoneGroups(Post, where, [
     { phone: key, userNames: [] },
   ]);
+
+  const sampleRow = await Post.findOne({
+    where: rowWhere,
+    order: [
+      ['scannedAt', 'DESC'],
+      ['id', 'DESC'],
+    ],
+  });
+  const samplePost = sampleRow ? toPublicPost(sampleRow) : null;
+
   return {
     phone: key,
     count,
     userNames: withNames?.userNames || [],
+    samplePost,
   };
 }
 
