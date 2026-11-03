@@ -72,6 +72,8 @@ let postLinksLoadSeq = 0;
 let phoneDebounceTimer = null;
 let toastTimer = null;
 let loadSeq = 0;
+let postsPhoneRowSeq = 0;
+let postsBodiesSeq = 0;
 
 function normalizePhone(input) {
   return String(input || '')
@@ -399,7 +401,13 @@ function applyPostsListResponse(data, { mergeStats = false } = {}) {
   if (!mergeStats) {
     posts.value = data.posts || [];
     serverPhoneGroups.value =
-      data.view === 'phone' && Array.isArray(data.phoneGroups) ? data.phoneGroups : null;
+      data.view === 'phone' && Array.isArray(data.phoneGroups)
+        ? data.phoneGroups.map((g) => ({
+            ...g,
+            countLoading: g.count == null,
+            userNamesLoading: g.count == null,
+          }))
+        : null;
   }
 
   if (data.total != null && data.total !== '') {
@@ -413,8 +421,82 @@ function applyPostsListResponse(data, { mergeStats = false } = {}) {
   filterSync.value = data.filterSync ?? filterSync.value;
 }
 
+function applyPostBodies(bodies = {}) {
+  if (!bodies || typeof bodies !== 'object') return;
+  posts.value = posts.value.map((p) => {
+    const body = bodies[p.id];
+    if (!body) return p;
+    return {
+      ...p,
+      postMessage: body.postMessage,
+      keyword: body.keyword ?? p.keyword,
+      bodyLoading: false,
+    };
+  });
+}
+
+function patchPhoneGroup(phone, patch) {
+  if (!Array.isArray(serverPhoneGroups.value)) return;
+  serverPhoneGroups.value = serverPhoneGroups.value.map((g) =>
+    g.phone === phone ? { ...g, ...patch } : g
+  );
+}
+
+async function loadPhoneRowDetailsSequential(parentSeq) {
+  const rowSeq = ++postsPhoneRowSeq;
+  const list = serverPhoneGroups.value || [];
+  for (let i = 0; i < list.length; i += 1) {
+    if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
+    const g = list[i];
+    if (!g?.phone) continue;
+
+    patchPhoneGroup(g.phone, { countLoading: true, userNamesLoading: true });
+
+    try {
+      const data = await api(
+        `/api/posts?${buildQuery()}&loadPhase=phone-row&phoneKey=${encodeURIComponent(g.phone)}`,
+        { token: token.value }
+      );
+      if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
+      const row = data.phoneRow || {};
+      patchPhoneGroup(g.phone, {
+        count: Number(row.count) || 0,
+        userNames: Array.isArray(row.userNames) ? row.userNames : [],
+        countLoading: false,
+        userNamesLoading: false,
+      });
+    } catch {
+      if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
+      patchPhoneGroup(g.phone, {
+        count: 0,
+        userNames: [],
+        countLoading: false,
+        userNamesLoading: false,
+      });
+    }
+  }
+}
+
+async function loadPostBodiesForPage(parentSeq) {
+  const bodySeq = ++postsBodiesSeq;
+  const ids = posts.value.map((p) => p.id).filter((id) => Number.isFinite(Number(id)));
+  if (!ids.length) return;
+
+  try {
+    const data = await api(`/api/posts?loadPhase=bodies&ids=${ids.join(',')}`, {
+      token: token.value,
+    });
+    if (bodySeq !== postsBodiesSeq || parentSeq !== loadSeq) return;
+    applyPostBodies(data.bodies);
+  } catch {
+    posts.value = posts.value.map((p) => ({ ...p, bodyLoading: false }));
+  }
+}
+
 async function loadPosts() {
   const seq = ++loadSeq;
+  postsPhoneRowSeq += 1;
+  postsBodiesSeq += 1;
   loading.value = true;
   loadingLabel.value = '';
   error.value = '';
@@ -423,7 +505,7 @@ async function loadPosts() {
     const baseQuery = buildQuery();
 
     if (isPhoneView) {
-      loadingLabel.value = 'Bước 1/2 — đang tải nhóm SĐT…';
+      loadingLabel.value = 'Đang tải danh sách SĐT…';
       const content = await api(`/api/posts?${baseQuery}&loadPhase=content`, {
         token: token.value,
       });
@@ -431,22 +513,36 @@ async function loadPosts() {
 
       applyPostsListResponse(content);
       loading.value = false;
-      loadingLabel.value = 'Bước 2/2 — đang đếm tổng (≈50%)…';
 
+      loadingLabel.value = 'Đang đếm tổng…';
       const stats = await api(`/api/posts?${baseQuery}&loadPhase=stats`, {
         token: token.value,
       });
       if (seq !== loadSeq) return;
-
       applyPostsListResponse(stats, { mergeStats: true });
+
+      loadingLabel.value = 'Đang bổ sung từng SĐT…';
+      await loadPhoneRowDetailsSequential(seq);
+      if (seq !== loadSeq) return;
       loadingLabel.value = '';
     } else {
-      loadingLabel.value = 'Đang tải bài đăng…';
-      const data = await api(`/api/posts?${baseQuery}`, {
+      loadingLabel.value = 'Đang tải thông tin bài…';
+      const content = await api(`/api/posts?${baseQuery}&loadPhase=content`, {
         token: token.value,
       });
       if (seq !== loadSeq) return;
-      applyPostsListResponse(data);
+
+      applyPostsListResponse(content);
+      loading.value = false;
+
+      loadingLabel.value = 'Đang tải nội dung & tổng…';
+      const [stats] = await Promise.all([
+        api(`/api/posts?${baseQuery}&loadPhase=stats`, { token: token.value }),
+        loadPostBodiesForPage(seq),
+      ]);
+      if (seq !== loadSeq) return;
+      applyPostsListResponse(stats, { mergeStats: true });
+      loadingLabel.value = '';
     }
 
     const maxPage = Math.max(1, Math.ceil(total.value / pageLimit.value) || 1);
@@ -1185,10 +1281,20 @@ onUnmounted(() => {
     </div>
 
     <LoadingState
-      v-if="loading || loadingLabel"
+      v-if="loading"
       block-layout
       :label="loadingLabel || 'Đang tải bài đăng…'"
     />
+
+    <div
+      v-else-if="loadingLabel"
+      class="alert alert--ok filter-sync-banner"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="spinner spinner--sm" aria-hidden="true" />
+      {{ loadingLabel }}
+    </div>
 
     <div class="panel-loading-wrap">
       <template v-if="activeTab === 'phone' ? phoneGroups.length : posts.length">
@@ -1223,7 +1329,16 @@ onUnmounted(() => {
               </td>
               <td class="col-stt mono">{{ rowStt(index) }}</td>
               <td class="mono cell-id">{{ shortPostId(p.postId) }}</td>
-              <td class="cell-message" :title="p.postMessage">{{ truncate(p.postMessage, 100) }}</td>
+              <td class="cell-message" :title="p.postMessage || ''">
+                <span
+                  v-if="p.bodyLoading && p.postMessage == null"
+                  class="stat-count-cell__loading"
+                  title="Đang tải nội dung"
+                >
+                  <span class="spinner spinner--sm" aria-hidden="true" />
+                </span>
+                <template v-else>{{ truncate(p.postMessage, 100) }}</template>
+              </td>
               <td>
                 <span v-if="p.phone" class="phone-cell">
                   <span class="mono table-link-color">{{ p.phone }}</span>
@@ -1329,15 +1444,33 @@ onUnmounted(() => {
                   </button>
                 </span>
               </td>
-              <td>{{ group.userNames.length ? group.userNames.join(', ') : '—' }}</td>
               <td>
+                <span
+                  v-if="group.userNamesLoading && (!group.userNames || !group.userNames.length)"
+                  class="stat-count-cell__loading"
+                >
+                  <span class="spinner spinner--sm" aria-hidden="true" />
+                </span>
+                <template v-else>
+                  {{ group.userNames?.length ? group.userNames.join(', ') : '—' }}
+                </template>
+              </td>
+              <td>
+                <span
+                  v-if="group.countLoading || group.count == null"
+                  class="stat-count-cell__loading"
+                  title="Đang đếm bài"
+                >
+                  <span class="spinner spinner--sm" aria-hidden="true" />
+                </span>
                 <button
+                  v-else
                   class="phone-count-btn"
                   type="button"
-                  :title="`Xem ${group.count || 0} link bài`"
+                  :title="`Xem ${group.count} link bài`"
                   @click="openPostLinksModal(group)"
                 >
-                  {{ group.count || 0 }}
+                  {{ group.count }}
                 </button>
               </td>
               <td class="muted">{{ formatLatest(group.latestTime) }}</td>

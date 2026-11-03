@@ -1,6 +1,11 @@
 const { Op, fn, col, literal } = require('sequelize');
 const { getModels } = require('../models');
-const { toPublicPost, normalizePostInput } = require('../utils/post');
+const {
+  toPublicPost,
+  toPublicPostLite,
+  normalizePostInput,
+  POST_LIST_LITE_ATTRIBUTES,
+} = require('../utils/post');
 const {
   keywordPathsWhere,
   isFtsResultCacheError,
@@ -369,8 +374,85 @@ async function assembleListWhere(query, keywordMatch, filterId = null) {
 
 function parseLoadPhase(query = {}) {
   const raw = String(query.loadPhase || 'all').trim().toLowerCase();
-  if (raw === 'content' || raw === 'stats') return raw;
+  if (raw === 'content' || raw === 'stats' || raw === 'phone-row' || raw === 'bodies') {
+    return raw;
+  }
   return 'all';
+}
+
+function parsePostIdsQuery(query = {}) {
+  const raw = String(query.ids || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((n) => Number(n))
+    .filter((id) => Number.isFinite(id) && id > 0)
+    .slice(0, 500);
+}
+
+async function listPhoneGroupsPageMinimal(Post, where, limit, offset) {
+  const rows = await Post.findAll({
+    attributes: [
+      [literal(PHONE_KEY_SQL), 'phone'],
+      [fn('MAX', col('scanned_at')), 'latestScannedAt'],
+      [fn('MAX', col('created_time')), 'latestCreatedTime'],
+    ],
+    where,
+    group: [literal(PHONE_KEY_SQL)],
+    order: [
+      [literal('latestScannedAt'), 'DESC'],
+      [literal(PHONE_KEY_SQL), 'ASC'],
+    ],
+    limit,
+    offset,
+    raw: true,
+    subQuery: false,
+  });
+
+  return rows.map((row) => ({
+    phone: normalizePhoneKey(row.phone),
+    count: null,
+    userNames: [],
+    latestTime: createdTimeToMs(row.latestCreatedTime),
+    latestScannedAt:
+      row.latestScannedAt != null && row.latestScannedAt !== ''
+        ? Number(row.latestScannedAt)
+        : null,
+    samplePost: null,
+    posts: [],
+  }));
+}
+
+async function fetchPhoneRowDetail(Post, where, phoneKey) {
+  const { sequelize } = Post;
+  const key = normalizePhoneKey(phoneKey);
+  const rowWhere = andWhere(where, whereForPhoneKey(sequelize, key));
+  const count = await Post.count({ where: rowWhere });
+  const [withNames] = await attachUserNamesToPhoneGroups(Post, where, [
+    { phone: key, userNames: [] },
+  ]);
+  return {
+    phone: key,
+    count,
+    userNames: withNames?.userNames || [],
+  };
+}
+
+async function fetchPostBodies(Post, ids) {
+  if (!ids.length) return {};
+  const rows = await Post.findAll({
+    where: { id: { [Op.in]: ids } },
+    attributes: ['id', 'postMessage', 'keyword'],
+  });
+  const bodies = {};
+  for (const row of rows) {
+    const json = row.toJSON ? row.toJSON() : row;
+    bodies[json.id] = {
+      postMessage: json.postMessage,
+      keyword: json.keyword || '',
+    };
+  }
+  return bodies;
 }
 
 async function fetchPostsListPayload(
@@ -399,7 +481,10 @@ async function fetchPostsListPayload(
       };
     }
 
-    const phoneGroups = await listPhoneGroupsPage(Post, where, limit, offset);
+    const phoneGroups =
+      loadPhase === 'content'
+        ? await listPhoneGroupsPageMinimal(Post, where, limit, offset)
+        : await listPhoneGroupsPage(Post, where, limit, offset);
     const base = {
       view: 'phone',
       posts: phoneGroups.flatMap((g) => g.posts),
@@ -426,10 +511,39 @@ async function fetchPostsListPayload(
   const phoneExact = String(req.query.phoneExact || '').trim();
   const includeUserNames = Boolean(phoneExact) || req.query.includeUserNames === '1';
 
+  if (loadPhase === 'stats') {
+    const count = await Post.count({ where });
+    return {
+      view: 'post',
+      total: count,
+      matchedPostCount: count,
+      loadPhase: 'stats',
+    };
+  }
+
   const order = [
     ['createdTime', 'DESC'],
     ['id', 'DESC'],
   ];
+
+  if (loadPhase === 'content') {
+    const rows = await Post.findAll({
+      where,
+      order,
+      limit,
+      offset,
+      attributes: POST_LIST_LITE_ATTRIBUTES,
+    });
+    return {
+      view: 'post',
+      posts: rows.map(toPublicPostLite),
+      total: null,
+      matchedPostCount: null,
+      statsPending: true,
+      loadPhase: 'content',
+    };
+  }
+
   const rowsPromise = Post.findAll({ where, order, limit, offset });
   const countPromise = Post.count({ where });
   const resultPromise = Promise.all([rowsPromise, countPromise]).then(([rows, count]) => ({
@@ -494,6 +608,50 @@ async function listPosts(req, res, next) {
       filterSync = await getFilterSyncPublic(savedFilterId);
     }
 
+    const respondPayload = (payload) => {
+      const totalForPages =
+        payload.total != null && payload.total !== ''
+          ? Number(payload.total) || 0
+          : null;
+      res.json({
+        ok: true,
+        ...payload,
+        limit,
+        offset,
+        page: Math.floor(offset / limit) + 1,
+        totalPages:
+          totalForPages != null
+            ? Math.max(1, Math.ceil(totalForPages / limit) || 1)
+            : null,
+        filters: filterMeta,
+        filterSync,
+      });
+    };
+
+    if (loadPhase === 'phone-row') {
+      const phoneKey = String(req.query.phoneKey || '').trim();
+      if (!phoneKey) {
+        return res.status(400).json({ ok: false, error: 'Thiếu phoneKey' });
+      }
+      try {
+        const row = await fetchPhoneRowDetail(Post, where, phoneKey);
+        return respondPayload({ view: 'phone', loadPhase: 'phone-row', phoneRow: row });
+      } catch (err) {
+        if (savedFilterId || !isFtsResultCacheError(err)) throw err;
+        keywordMatch = 'substr';
+        campaignApplied = await assembleListWhere(req.query, keywordMatch, savedFilterId);
+        where = campaignApplied.where;
+        const row = await fetchPhoneRowDetail(Post, where, phoneKey);
+        return respondPayload({ view: 'phone', loadPhase: 'phone-row', phoneRow: row });
+      }
+    }
+
+    if (loadPhase === 'bodies') {
+      const ids = parsePostIdsQuery(req.query);
+      const bodies = await fetchPostBodies(Post, ids);
+      return respondPayload({ view: 'post', loadPhase: 'bodies', bodies });
+    }
+
     let payload;
     try {
       payload = await fetchPostsListPayload(
@@ -524,24 +682,7 @@ async function listPosts(req, res, next) {
       );
     }
 
-    const totalForPages =
-      payload.total != null && payload.total !== ''
-        ? Number(payload.total) || 0
-        : null;
-
-    res.json({
-      ok: true,
-      ...payload,
-      limit,
-      offset,
-      page: Math.floor(offset / limit) + 1,
-      totalPages:
-        totalForPages != null
-          ? Math.max(1, Math.ceil(totalForPages / limit) || 1)
-          : null,
-      filters: filterMeta,
-      filterSync,
-    });
+    respondPayload(payload);
   } catch (err) {
     next(err);
   }

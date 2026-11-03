@@ -21,6 +21,18 @@ function toPublicPost(post) {
   };
 }
 
+/** Danh sách bài — bỏ TEXT nặng; loadPhase=bodies bổ sung sau. */
+function toPublicPostLite(post) {
+  const row = toPublicPost(post);
+  if (!row) return null;
+  return {
+    ...row,
+    postMessage: null,
+    keyword: null,
+    bodyLoading: true,
+  };
+}
+
 function normalizePostInput(body = {}) {
   const payload = {
     postId: String(body.postId || '').trim(),
@@ -47,4 +59,24 @@ function normalizePostInput(body = {}) {
   return payload;
 }
 
-module.exports = { toPublicPost, normalizePostInput };
+const POST_LIST_LITE_ATTRIBUTES = [
+  'id',
+  'postId',
+  'postUrl',
+  'groupId',
+  'groupName',
+  'fbUserId',
+  'userName',
+  'userUrl',
+  'phone',
+  'thesame',
+  'createdTime',
+  'scannedAt',
+];
+
+module.exports = {
+  toPublicPost,
+  toPublicPostLite,
+  normalizePostInput,
+  POST_LIST_LITE_ATTRIBUTES,
+};
