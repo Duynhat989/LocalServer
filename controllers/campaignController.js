@@ -606,12 +606,32 @@ async function enrichCampaignItemFromPost(Post, item, options = {}) {
 
 async function executeAddPhonesForTask(task) {
   const id = task.campaignId;
-  const items = task._items || [];
   const enrichOptions = task._enrichOptions || {};
   const { Campaign, CampaignPhone, Post } = getModels();
   const campaign = await Campaign.findByPk(id);
   if (!campaign) {
     throw new Error('Không tìm thấy chiến dịch');
+  }
+
+  if (task._pushAll) {
+    const { collectPhonesForCampaignPush } = require('./postController');
+    const { items, total } = await collectPhonesForCampaignPush(task._listQuery || {});
+    task._items = items;
+    task.total = total;
+    task.processed = 0;
+    delete task._pushAll;
+    delete task._listQuery;
+  }
+
+  const items = task._items || [];
+  if (!items.length) {
+    task.status = 'done';
+    task.finishedAt = Date.now();
+    task.added = 0;
+    task.duplicateCount = 0;
+    delete task._items;
+    delete task._enrichOptions;
+    return;
   }
 
   const stepAdd = generateStepAdd(20);
@@ -701,6 +721,24 @@ async function executeAddPhonesForTask(task) {
   delete task._enrichOptions;
 }
 
+function listQueryFromPushBody(body = {}) {
+  const q = {};
+  const phone = String(body.phone || '').trim();
+  if (phone) q.phone = phone;
+  const groupId = String(body.groupId || '').trim();
+  if (groupId) q.groupId = groupId;
+  const filterId = parseFilterIdFromBody(body);
+  if (filterId) q.filterId = String(filterId);
+  if (body.paths != null && String(body.paths).trim()) {
+    q.paths = body.paths;
+  }
+  if (body.pushedFrom) q.pushedFrom = body.pushedFrom;
+  if (body.pushedTo) q.pushedTo = body.pushedTo;
+  if (body.campaignId != null) q.campaignId = body.campaignId;
+  if (body.campaignMembership) q.campaignMembership = body.campaignMembership;
+  return q;
+}
+
 async function addPhones(req, res) {
   try {
     const id = Number(req.params.id);
@@ -708,8 +746,9 @@ async function addPhones(req, res) {
       return res.status(400).json({ ok: false, error: 'ID không hợp lệ' });
     }
 
-    const items = normalizePhoneList(req.body);
-    if (!items.length) {
+    const pushAll = Boolean(req.body.all || req.body.pushAll);
+    const items = pushAll ? [] : normalizePhoneList(req.body);
+    if (!pushAll && !items.length) {
       return res.status(400).json({ ok: false, error: 'Thiếu số điện thoại' });
     }
 
@@ -731,6 +770,9 @@ async function addPhones(req, res) {
       username: req.user?.username ?? null,
       items,
       enrichOptions,
+      pushAll,
+      listQuery: pushAll ? listQueryFromPushBody(req.body) : null,
+      estimatedTotal: pushAll ? Number(req.body.estimatedTotal) || 0 : items.length,
     });
 
     res.status(202).json({

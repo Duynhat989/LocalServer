@@ -305,9 +305,29 @@ const selectedCount = computed(() =>
   activeTab.value === 'phone' ? selectedPhones.value.length : selectedPostIds.value.length
 );
 
-const canPushToCampaign = computed(
-  () => isStaff.value && selectedCount.value > 0
+const campaignPushUsesAll = computed(
+  () => activeTab.value === 'phone' && selectedPhones.value.length === 0
 );
+
+const campaignPushTargetCount = computed(() => {
+  if (activeTab.value === 'phone' && campaignPushUsesAll.value) {
+    return Number(total.value) || 0;
+  }
+  return selectedCount.value;
+});
+
+const canPushToCampaign = computed(() => {
+  if (!isStaff.value) return false;
+  if (activeTab.value === 'phone') return (Number(total.value) || 0) > 0;
+  return selectedCount.value > 0;
+});
+
+const campaignPushButtonLabel = computed(() => {
+  if (activeTab.value === 'phone' && campaignPushUsesAll.value) {
+    return `Đẩy tất cả vào chiến dịch (${campaignPushTargetCount.value})`;
+  }
+  return `Đẩy vào chiến dịch (${campaignPushTargetCount.value})`;
+});
 
 const totalPages = computed(() => Math.max(1, Math.ceil((total.value || 0) / pageLimit.value) || 1));
 
@@ -728,9 +748,47 @@ function buildSelectedCampaignPhones() {
 
 const selectedCampaignPhones = computed(() => buildSelectedCampaignPhones());
 
+function buildCampaignPushBody() {
+  const body = {};
+  if (campaignPushUsesAll.value) {
+    body.all = true;
+    body.estimatedTotal = Number(total.value) || 0;
+  } else {
+    body.phones = selectedCampaignPhones.value;
+  }
+
+  const savedFilterId = getActiveFilterId();
+  if (savedFilterId != null) {
+    body.filterId = savedFilterId;
+  } else if (keywordPaths.value.length) {
+    body.paths = JSON.stringify(keywordPaths.value);
+  }
+
+  const phone = String(phoneFilterApplied.value || '').trim();
+  if (phone) body.phone = phone;
+
+  const groupId = String(groupFilter.value || '').trim();
+  if (groupId) body.groupId = groupId;
+
+  if (pushedOn.value) {
+    body.pushedFrom = pushedOn.value;
+    body.pushedTo = pushedOn.value;
+  }
+
+  if (hasCampaignFilter.value) {
+    body.campaignId = String(campaignFilterId.value);
+    body.campaignMembership = campaignFilterMembership.value;
+  }
+
+  return body;
+}
+
 async function openCampaignModal() {
-  const phones = selectedCampaignPhones.value;
-  if (!phones.length) {
+  if (!canPushToCampaign.value) {
+    showToast('Không có SĐT hợp lệ để đẩy');
+    return;
+  }
+  if (!campaignPushUsesAll.value && !selectedCampaignPhones.value.length) {
     showToast('Không có SĐT hợp lệ để đẩy');
     return;
   }
@@ -818,8 +876,11 @@ async function pushToCampaign() {
     pushError.value = 'Chọn chiến dịch';
     return;
   }
-  const phones = selectedCampaignPhones.value;
-  if (!phones.length) {
+  if (!canPushToCampaign.value) {
+    pushError.value = 'Không có SĐT hợp lệ';
+    return;
+  }
+  if (!campaignPushUsesAll.value && !selectedCampaignPhones.value.length) {
     pushError.value = 'Không có SĐT hợp lệ';
     return;
   }
@@ -827,17 +888,7 @@ async function pushToCampaign() {
   pushBusy.value = true;
   pushError.value = '';
   try {
-    const body = { phones };
-    const savedFilterId = getActiveFilterId();
-    if (savedFilterId != null) {
-      body.filterId = savedFilterId;
-    }
-    const groupId = String(groupFilter.value || '').trim();
-    if (groupId) body.groupId = groupId;
-    if (pushedOn.value) {
-      body.pushedFrom = pushedOn.value;
-      body.pushedTo = pushedOn.value;
-    }
+    const body = buildCampaignPushBody();
     const data = await api(`/api/campaigns/${campaignId}/phones`, {
       method: 'POST',
       token: token.value,
@@ -1060,7 +1111,7 @@ onUnmounted(() => {
           @click="openCampaignModal"
         >
           <Megaphone class="btn__icon" aria-hidden="true" />
-          Đẩy vào chiến dịch ({{ selectedCount }})
+          {{ campaignPushButtonLabel }}
         </button>
         <label class="limit-select">
           <span>Limit</span>
@@ -1739,7 +1790,13 @@ onUnmounted(() => {
         <div class="modal-head">
           <div>
             <h3 id="push-campaign-title">Đẩy vào chiến dịch</h3>
-            <p>{{ selectedCampaignPhones.length }} SĐT sẽ được thêm (trùng thì bỏ qua)</p>
+            <p v-if="campaignPushUsesAll">
+              Đẩy <strong>tất cả {{ total }} SĐT</strong> khớp bộ lọc hiện tại (không chỉ trang
+              Limit {{ pageLimit }}). Trùng trong chiến dịch thì bỏ qua.
+            </p>
+            <p v-else>
+              {{ selectedCampaignPhones.length }} SĐT đã chọn sẽ được thêm (trùng thì bỏ qua)
+            </p>
           </div>
           <button class="modal-close" type="button" aria-label="Đóng" @click="closeCampaignModal">
             ×

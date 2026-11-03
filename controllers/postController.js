@@ -13,6 +13,7 @@ const {
 } = require('../utils/postKeywordSearch');
 const { queueAttachPosts, getFilterSyncPublic } = require('../jobs/filterPostsSync');
 const { toKeyword } = require('../utils/text');
+const { normalizePhone } = require('../utils/campaign');
 
 const ALLOWED_LIMITS = [50, 100, 200, 500, 1000, 10000];
 const EMPTY_PHONE_LABEL = 'Không có SĐT';
@@ -1052,10 +1053,54 @@ async function deletePostsByGroup(req, res) {
   }
 }
 
+async function resolveWhereForPhoneCollect(query = {}) {
+  const { sequelize } = getModels();
+  const savedFilterId = parseFilterId(query);
+  const filterPaths = savedFilterId ? [] : parsePaths(query.paths);
+  let keywordMatch = savedFilterId
+    ? 'fulltext'
+    : resolveKeywordMatch(filterPaths, query, sequelize.getDialect());
+  try {
+    const campaignApplied = await assembleListWhere(query, keywordMatch, savedFilterId);
+    return campaignApplied.where;
+  } catch (err) {
+    if (savedFilterId || !isFtsResultCacheError(err)) throw err;
+    keywordMatch = 'substr';
+    const campaignApplied = await assembleListWhere(query, keywordMatch, savedFilterId);
+    return campaignApplied.where;
+  }
+}
+
+/** Toàn bộ SĐT khớp bộ lọc (không theo limit/offset trang Posts). */
+async function collectPhonesForCampaignPush(query = {}) {
+  const { Post } = getModels();
+  const where = await resolveWhereForPhoneCollect(query);
+  const distinctTotal = await countDistinctPhones(Post, where);
+  const seen = new Set();
+  const items = [];
+  const batchSize = 500;
+
+  for (let offset = 0; offset < distinctTotal; offset += batchSize) {
+    const groups = await listPhoneGroupsPageMinimal(Post, where, batchSize, offset);
+    if (!groups.length) break;
+    for (const g of groups) {
+      if (g.phone === EMPTY_PHONE_LABEL) continue;
+      const phone = normalizePhone(g.phone);
+      if (!phone || seen.has(phone)) continue;
+      seen.add(phone);
+      items.push({ phone });
+    }
+    if (groups.length < batchSize) break;
+  }
+
+  return { items, total: items.length, distinctTotal };
+}
+
 module.exports = {
   listPosts,
   createPost,
   createPostsBulk,
   checkPostsExist,
   deletePostsByGroup,
+  collectPhonesForCampaignPush,
 };

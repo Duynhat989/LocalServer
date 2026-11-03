@@ -55,7 +55,9 @@ function createCampaignPhonePushTask(payload) {
     userId: payload.userId ?? null,
     username: payload.username ?? null,
     status: 'pending',
-    total: payload.items.length,
+    total: payload.pushAll
+      ? Math.max(0, Number(payload.estimatedTotal) || 0)
+      : payload.items.length,
     processed: 0,
     added: 0,
     duplicateCount: 0,
@@ -64,7 +66,10 @@ function createCampaignPhonePushTask(payload) {
     error: null,
     createdAt: Date.now(),
     finishedAt: null,
-    _items: payload.items,
+    pushAll: Boolean(payload.pushAll),
+    _pushAll: Boolean(payload.pushAll),
+    _listQuery: payload.listQuery || null,
+    _items: payload.pushAll ? null : payload.items,
     _enrichOptions: payload.enrichOptions || {},
   };
 
@@ -79,6 +84,8 @@ function createCampaignPhonePushTask(payload) {
       t.finishedAt = Date.now();
       delete t._items;
       delete t._enrichOptions;
+      delete t._pushAll;
+      delete t._listQuery;
     });
   });
 
