@@ -6,6 +6,7 @@ import { api } from '../api';
 import { useAuth } from '../composables/useAuth';
 import KeywordFilterFlow from '../components/KeywordFilterFlow.vue';
 import LoadingState from '../components/LoadingState.vue';
+import LoadingGif from '../components/LoadingGif.vue';
 import {
   getActiveFilterId,
   getActiveFilterPaths,
@@ -14,7 +15,6 @@ import {
 } from '../utils/keywordFlow';
 
 const LIMIT_OPTIONS = [100, 200, 500, 1000, 10000];
-
 const route = useRoute();
 const router = useRouter();
 const { token, isStaff } = useAuth();
@@ -48,6 +48,8 @@ const campaigns = ref([]);
 const campaignsLoading = ref(false);
 const selectedCampaignId = ref(null);
 const pushBusy = ref(false);
+const pushTask = ref(null);
+let pushTaskPollTimer = null;
 const pushError = ref('');
 
 const showCampaignFilterModal = ref(false);
@@ -72,8 +74,6 @@ let postLinksLoadSeq = 0;
 let phoneDebounceTimer = null;
 let toastTimer = null;
 let loadSeq = 0;
-let postsPhoneRowSeq = 0;
-let postsBodiesSeq = 0;
 
 function normalizePhone(input) {
   return String(input || '')
@@ -277,6 +277,21 @@ const campaignFilterLabel = computed(() => {
   return `${name} · ${kind}`;
 });
 
+const showKeywordFilterChip = computed(
+  () =>
+    Boolean(String(activeFilterName.value || '').trim()) ||
+    Boolean(String(keywordExpression.value || '').trim()) ||
+    keywordPaths.value.length > 0
+);
+
+const keywordFilterChipLabel = computed(() => {
+  const name = String(activeFilterName.value || '').trim();
+  if (name) return name;
+  const expr = String(keywordExpression.value || '').trim();
+  if (!expr) return 'Bộ lọc keyword';
+  return expr.length > 60 ? `${expr.slice(0, 60)}…` : expr;
+});
+
 const hasActiveFilters = computed(
   () =>
     Boolean(phoneFilterApplied.value.trim()) ||
@@ -401,13 +416,7 @@ function applyPostsListResponse(data, { mergeStats = false } = {}) {
   if (!mergeStats) {
     posts.value = data.posts || [];
     serverPhoneGroups.value =
-      data.view === 'phone' && Array.isArray(data.phoneGroups)
-        ? data.phoneGroups.map((g) => ({
-            ...g,
-            countLoading: g.count == null,
-            userNamesLoading: g.count == null,
-          }))
-        : null;
+      data.view === 'phone' && Array.isArray(data.phoneGroups) ? data.phoneGroups : null;
   }
 
   if (data.total != null && data.total !== '') {
@@ -421,85 +430,8 @@ function applyPostsListResponse(data, { mergeStats = false } = {}) {
   filterSync.value = data.filterSync ?? filterSync.value;
 }
 
-function applyPostBodies(bodies = {}) {
-  if (!bodies || typeof bodies !== 'object') return;
-  posts.value = posts.value.map((p) => {
-    const body = bodies[p.id];
-    if (!body) return p;
-    return {
-      ...p,
-      postMessage: body.postMessage,
-      keyword: body.keyword ?? p.keyword,
-      bodyLoading: false,
-    };
-  });
-}
-
-function patchPhoneGroup(phone, patch) {
-  if (!Array.isArray(serverPhoneGroups.value)) return;
-  serverPhoneGroups.value = serverPhoneGroups.value.map((g) =>
-    g.phone === phone ? { ...g, ...patch } : g
-  );
-}
-
-async function loadPhoneRowDetailsSequential(parentSeq) {
-  const rowSeq = ++postsPhoneRowSeq;
-  const list = serverPhoneGroups.value || [];
-  for (let i = 0; i < list.length; i += 1) {
-    if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
-    const g = list[i];
-    if (!g?.phone) continue;
-
-    patchPhoneGroup(g.phone, { countLoading: true, userNamesLoading: true });
-
-    try {
-      const data = await api(
-        `/api/posts?${buildQuery()}&loadPhase=phone-row&phoneKey=${encodeURIComponent(g.phone)}`,
-        { token: token.value }
-      );
-      if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
-      const row = data.phoneRow || {};
-      const samplePost = row.samplePost || null;
-      patchPhoneGroup(g.phone, {
-        count: Number(row.count) || 0,
-        userNames: Array.isArray(row.userNames) ? row.userNames : [],
-        countLoading: false,
-        userNamesLoading: false,
-        samplePost,
-        posts: samplePost ? [samplePost] : [],
-      });
-    } catch {
-      if (rowSeq !== postsPhoneRowSeq || parentSeq !== loadSeq) return;
-      patchPhoneGroup(g.phone, {
-        count: 0,
-        userNames: [],
-        countLoading: false,
-        userNamesLoading: false,
-      });
-    }
-  }
-}
-
-async function loadPostBodiesForPage(parentSeq) {
-  const bodySeq = ++postsBodiesSeq;
-  const ids = posts.value.map((p) => p.id).filter((id) => Number.isFinite(Number(id)));
-  if (!ids.length) return;
-
-  try {
-    const data = await api(`/api/posts?loadPhase=bodies&ids=${ids.join(',')}`, {
-      token: token.value,
-    });
-    if (bodySeq !== postsBodiesSeq || parentSeq !== loadSeq) return;
-    applyPostBodies(data.bodies);
-  } catch {
-    posts.value = posts.value.map((p) => ({ ...p, bodyLoading: false }));
-  }
-}
-
 async function loadPosts() {
   const seq = ++loadSeq;
-  postsPhoneRowSeq += 1;
-  postsBodiesSeq += 1;
   loading.value = true;
   loadingLabel.value = '';
   error.value = '';
@@ -517,16 +449,12 @@ async function loadPosts() {
       applyPostsListResponse(content);
       loading.value = false;
 
-      loadingLabel.value = 'Đang đếm tổng…';
+      loadingLabel.value = 'Đang đếm tổng SĐT…';
       const stats = await api(`/api/posts?${baseQuery}&loadPhase=stats`, {
         token: token.value,
       });
       if (seq !== loadSeq) return;
       applyPostsListResponse(stats, { mergeStats: true });
-
-      loadingLabel.value = 'Đang bổ sung từng SĐT…';
-      await loadPhoneRowDetailsSequential(seq);
-      if (seq !== loadSeq) return;
       loadingLabel.value = '';
     } else {
       loadingLabel.value = 'Đang tải thông tin bài…';
@@ -538,11 +466,10 @@ async function loadPosts() {
       applyPostsListResponse(content);
       loading.value = false;
 
-      loadingLabel.value = 'Đang tải nội dung & tổng…';
-      const [stats] = await Promise.all([
-        api(`/api/posts?${baseQuery}&loadPhase=stats`, { token: token.value }),
-        loadPostBodiesForPage(seq),
-      ]);
+      loadingLabel.value = 'Đang đếm tổng…';
+      const stats = await api(`/api/posts?${baseQuery}&loadPhase=stats`, {
+        token: token.value,
+      });
       if (seq !== loadSeq) return;
       applyPostsListResponse(stats, { mergeStats: true });
       loadingLabel.value = '';
@@ -776,75 +703,34 @@ async function copyPhone(phone) {
   showToast(`Đã sao chép ${value}`);
 }
 
-function pickSourcePost(groupOrPosts) {
-  if (groupOrPosts && !Array.isArray(groupOrPosts) && groupOrPosts.samplePost) {
-    return groupOrPosts.samplePost;
-  }
-  const postsList = Array.isArray(groupOrPosts)
-    ? groupOrPosts
-    : groupOrPosts?.posts || [];
-  if (!postsList.length) return null;
-  return [...postsList].sort((a, b) => {
-    const ta = a.created_time ? new Date(a.created_time).getTime() : Infinity;
-    const tb = b.created_time ? new Date(b.created_time).getTime() : Infinity;
-    return ta - tb;
-  })[0];
-}
-
-function itemFromPost(post, phoneOverride) {
-  const phone = normalizePhone(phoneOverride || post?.phone);
-  if (!phone) return null;
-  return {
-    phone,
-    postId: post?.postId || null,
-    postMessage: post?.postMessage || null,
-    postUrl: post?.postUrl || null,
-    groupId: post?.groupId || null,
-    groupName: post?.groupName || null,
-    userId: post?.userId || null,
-    userName: post?.userName || null,
-    userUrl: post?.userUrl || null,
-    thesame: post?.thesame || null,
-    created_time: post?.created_time || null,
-    scannedAt: post?.scannedAt ?? null,
-    keyword: post?.keyword || null,
-  };
-}
-
-function buildSelectedCampaignItems() {
-  const map = new Map();
+function buildSelectedCampaignPhones() {
+  const set = new Set();
 
   if (activeTab.value === 'phone') {
     for (const group of phoneGroups.value) {
       if (!selectedPhones.value.includes(group.phone)) continue;
       const phone = normalizePhone(group.phone);
-      if (!phone || map.has(phone)) continue;
-      const source = pickSourcePost(group);
-      const item = itemFromPost(source, phone);
-      if (!item) continue;
-      if (group.userNames?.length) {
-        item.userName = group.userNames.join(', ');
-      }
-      map.set(phone, item);
+      if (!phone) continue;
+      set.add(phone);
     }
   } else {
     const selected = new Set(selectedPostIds.value);
     for (const post of posts.value) {
       if (!selected.has(postKey(post))) continue;
-      const item = itemFromPost(post);
-      if (!item || map.has(item.phone)) continue;
-      map.set(item.phone, item);
+      const phone = normalizePhone(post.phone);
+      if (!phone) continue;
+      set.add(phone);
     }
   }
 
-  return Array.from(map.values());
+  return Array.from(set);
 }
 
-const selectedCampaignItems = computed(() => buildSelectedCampaignItems());
+const selectedCampaignPhones = computed(() => buildSelectedCampaignPhones());
 
 async function openCampaignModal() {
-  const items = selectedCampaignItems.value;
-  if (!items.length) {
+  const phones = selectedCampaignPhones.value;
+  if (!phones.length) {
     showToast('Không có SĐT hợp lệ để đẩy');
     return;
   }
@@ -866,31 +752,64 @@ async function openCampaignModal() {
   }
 }
 
-function closeCampaignModal() {
-  if (pushBusy.value) return;
-  showCampaignModal.value = false;
-  pushError.value = '';
+function stopPushTaskPoll() {
+  if (pushTaskPollTimer) {
+    clearInterval(pushTaskPollTimer);
+    pushTaskPollTimer = null;
+  }
 }
 
-async function ensurePostBodiesForCampaignItems(items) {
-  const needIds = [];
-  for (const post of posts.value) {
-    if (!post?.id || !post.bodyLoading) continue;
-    const phone = normalizePhone(post.phone);
-    if (!phone) continue;
-    if (items.some((it) => normalizePhone(it.phone) === phone)) {
-      needIds.push(post.id);
-    }
+function finishPushTask(task) {
+  stopPushTaskPoll();
+  pushBusy.value = false;
+  if (task.status === 'error') {
+    pushError.value = task.error || 'Không đẩy được vào chiến dịch';
+    return;
   }
-  if (!needIds.length) return;
-  try {
-    const data = await api(`/api/posts?loadPhase=bodies&ids=${needIds.join(',')}`, {
-      token: token.value,
+  const parts = [];
+  if (task.added) parts.push(`Đã thêm ${task.added} SĐT`);
+  if (task.duplicateCount) parts.push(`Trùng bỏ qua: ${task.duplicateCount}`);
+  if (task.stepAdd) parts.push(`step_add ${task.stepAdd}`);
+  showToast(parts.join(' · ') || 'Không có SĐT mới');
+  showCampaignModal.value = false;
+  pushTask.value = null;
+  selectedPhones.value = [];
+  selectedPostIds.value = [];
+}
+
+async function pollPushTaskOnce(taskId) {
+  const data = await api(`/api/campaigns/phone-push-tasks/${encodeURIComponent(taskId)}`, {
+    token: token.value,
+  });
+  pushTask.value = data.task || null;
+  const status = data.task?.status;
+  if (status === 'done' || status === 'error') {
+    finishPushTask(data.task);
+  }
+}
+
+function startPushTaskPoll(taskId) {
+  stopPushTaskPoll();
+  pushTaskPollTimer = setInterval(() => {
+    pollPushTaskOnce(taskId).catch((err) => {
+      stopPushTaskPoll();
+      pushBusy.value = false;
+      pushError.value = err.message || 'Mất kết nối task đẩy chiến dịch';
     });
-    applyPostBodies(data.bodies);
-  } catch {
-    /* server sẽ bổ sung khi thêm CD */
-  }
+  }, 800);
+  pollPushTaskOnce(taskId).catch((err) => {
+    stopPushTaskPoll();
+    pushBusy.value = false;
+    pushError.value = err.message || 'Không theo dõi được task';
+  });
+}
+
+function closeCampaignModal() {
+  if (pushBusy.value) return;
+  stopPushTaskPoll();
+  pushTask.value = null;
+  showCampaignModal.value = false;
+  pushError.value = '';
 }
 
 async function pushToCampaign() {
@@ -899,39 +818,46 @@ async function pushToCampaign() {
     pushError.value = 'Chọn chiến dịch';
     return;
   }
-  let items = selectedCampaignItems.value;
-  if (!items.length) {
+  const phones = selectedCampaignPhones.value;
+  if (!phones.length) {
     pushError.value = 'Không có SĐT hợp lệ';
     return;
-  }
-
-  if (activeTab.value === 'post') {
-    await ensurePostBodiesForCampaignItems(items);
-    items = buildSelectedCampaignItems();
   }
 
   pushBusy.value = true;
   pushError.value = '';
   try {
+    const body = { phones };
+    const savedFilterId = getActiveFilterId();
+    if (savedFilterId != null) {
+      body.filterId = savedFilterId;
+    }
+    const groupId = String(groupFilter.value || '').trim();
+    if (groupId) body.groupId = groupId;
+    if (pushedOn.value) {
+      body.pushedFrom = pushedOn.value;
+      body.pushedTo = pushedOn.value;
+    }
     const data = await api(`/api/campaigns/${campaignId}/phones`, {
       method: 'POST',
       token: token.value,
-      body: { items },
+      body,
     });
-    const parts = [];
-    if (data.added) parts.push(`Đã thêm ${data.added} SĐT`);
-    if (data.duplicates?.length) {
-      parts.push(`Trùng bỏ qua: ${data.duplicates.length}`);
+    if (data.taskId) {
+      pushTask.value = data.task || { id: data.taskId, total: data.total, processed: 0, percent: 0 };
+      startPushTaskPoll(data.taskId);
+      return;
     }
-    if (data.stepAdd) parts.push(`step_add ${data.stepAdd}`);
-    showToast(parts.join(' · ') || 'Không có SĐT mới');
-    showCampaignModal.value = false;
-    selectedPhones.value = [];
-    selectedPostIds.value = [];
+    finishPushTask({
+      status: 'done',
+      added: data.added || 0,
+      duplicateCount: data.duplicates?.length || 0,
+      stepAdd: data.stepAdd,
+    });
   } catch (err) {
     pushError.value = err.message || 'Không đẩy được vào chiến dịch';
-  } finally {
     pushBusy.value = false;
+    stopPushTaskPoll();
   }
 }
 
@@ -1054,14 +980,12 @@ async function loadPostLinks() {
 function openPostLinksModal(group) {
   postLinksGroup.value = {
     phone: group.phone,
-    count: group.count || 0,
-    userNames: group.userNames || [],
   };
   postLinksNameFilter.value = '';
   postLinksPage.value = 1;
   postLinksPosts.value = [];
-  postLinksTotal.value = Number(group.count) || 0;
-  postLinksNameOptions.value = Array.isArray(group.userNames) ? [...group.userNames] : [];
+  postLinksTotal.value = 0;
+  postLinksNameOptions.value = [];
   showPostLinksModal.value = true;
   loadPostLinks();
 }
@@ -1109,6 +1033,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopFilterSyncPoll();
+  stopPushTaskPoll();
 });
 </script>
 
@@ -1144,7 +1069,7 @@ onUnmounted(() => {
           </select>
         </label>
         <button class="btn btn--ghost btn--inline" type="button" :disabled="loading" @click="loadPosts">
-          <span v-if="loading" class="spinner spinner--sm" aria-hidden="true" />
+          <LoadingGif v-if="loading" size="sm" />
           <RefreshCw v-else class="btn__icon" aria-hidden="true" />
           {{ loading ? 'Đang tải…' : 'Làm mới' }}
         </button>
@@ -1287,12 +1212,14 @@ onUnmounted(() => {
           <span aria-hidden="true">×</span>
         </button>
         <button
-          v-if="keywordExpression"
-          class="filter-chip filter-chip--wide"
+          v-if="showKeywordFilterChip"
+          class="filter-chip"
+          :class="{ 'filter-chip--wide': !activeFilterName }"
           type="button"
+          :title="keywordExpression || activeFilterName"
           @click="showKeywordFlow = true"
         >
-          <span v-if="activeFilterName">{{ activeFilterName }} · </span>{{ keywordExpression }}
+          {{ keywordFilterChipLabel }}
         </button>
       </div>
     </div>
@@ -1305,7 +1232,7 @@ onUnmounted(() => {
       role="status"
       aria-live="polite"
     >
-      <span class="spinner spinner--sm" aria-hidden="true" />
+      <LoadingGif size="sm" />
       {{ filterSyncLabel }}
     </div>
 
@@ -1321,7 +1248,7 @@ onUnmounted(() => {
       role="status"
       aria-live="polite"
     >
-      <span class="spinner spinner--sm" aria-hidden="true" />
+      <LoadingGif size="sm" />
       {{ loadingLabel }}
     </div>
 
@@ -1336,7 +1263,6 @@ onUnmounted(() => {
               </th>
               <th class="col-stt">STT</th>
               <th>postId</th>
-              <th>postMessage</th>
               <th>phone</th>
               <th>userName</th>
               <th>groupName</th>
@@ -1358,16 +1284,6 @@ onUnmounted(() => {
               </td>
               <td class="col-stt mono">{{ rowStt(index) }}</td>
               <td class="mono cell-id">{{ shortPostId(p.postId) }}</td>
-              <td class="cell-message" :title="p.postMessage || ''">
-                <span
-                  v-if="p.bodyLoading && p.postMessage == null"
-                  class="stat-count-cell__loading"
-                  title="Đang tải nội dung"
-                >
-                  <span class="spinner spinner--sm" aria-hidden="true" />
-                </span>
-                <template v-else>{{ truncate(p.postMessage, 100) }}</template>
-              </td>
               <td>
                 <span v-if="p.phone" class="phone-cell">
                   <span class="mono table-link-color">{{ p.phone }}</span>
@@ -1433,8 +1349,7 @@ onUnmounted(() => {
               </th>
               <th class="col-stt">STT</th>
               <th>SĐT</th>
-              <th>Tên FB</th>
-              <th>Số bài</th>
+              <th>Chi tiết</th>
               <th>Thời gian gần nhất</th>
               <th>Thời gian quét mới nhất</th>
             </tr>
@@ -1474,32 +1389,12 @@ onUnmounted(() => {
                 </span>
               </td>
               <td>
-                <span
-                  v-if="group.userNamesLoading && (!group.userNames || !group.userNames.length)"
-                  class="stat-count-cell__loading"
-                >
-                  <span class="spinner spinner--sm" aria-hidden="true" />
-                </span>
-                <template v-else>
-                  {{ group.userNames?.length ? group.userNames.join(', ') : '—' }}
-                </template>
-              </td>
-              <td>
-                <span
-                  v-if="group.countLoading || group.count == null"
-                  class="stat-count-cell__loading"
-                  title="Đang đếm bài"
-                >
-                  <span class="spinner spinner--sm" aria-hidden="true" />
-                </span>
                 <button
-                  v-else
-                  class="phone-count-btn"
+                  class="phone-detail-link"
                   type="button"
-                  :title="`Xem ${group.count} link bài`"
                   @click="openPostLinksModal(group)"
                 >
-                  {{ group.count }}
+                  Xem chi tiết
                 </button>
               </td>
               <td class="muted">{{ formatLatest(group.latestTime) }}</td>
@@ -1599,11 +1494,9 @@ onUnmounted(() => {
             <p>
               SĐT
               <span class="mono table-link-color">{{ postLinksGroup.phone }}</span>
-              · {{ postLinksTotal }}
-              <template v-if="postLinksNameFilter && postLinksGroup.count && postLinksTotal !== postLinksGroup.count">
-                / {{ postLinksGroup.count }}
-              </template>
-              bài
+              ·
+              <template v-if="postLinksLoading && !postLinksTotal"> đang đếm…</template>
+              <template v-else> {{ postLinksTotal }} bài</template>
             </p>
           </div>
           <button class="modal-close" type="button" aria-label="Đóng" @click="closePostLinksModal">
@@ -1846,7 +1739,7 @@ onUnmounted(() => {
         <div class="modal-head">
           <div>
             <h3 id="push-campaign-title">Đẩy vào chiến dịch</h3>
-            <p>{{ selectedCampaignItems.length }} SĐT sẽ được thêm (trùng thì bỏ qua)</p>
+            <p>{{ selectedCampaignPhones.length }} SĐT sẽ được thêm (trùng thì bỏ qua)</p>
           </div>
           <button class="modal-close" type="button" aria-label="Đóng" @click="closeCampaignModal">
             ×
@@ -1854,6 +1747,26 @@ onUnmounted(() => {
         </div>
 
         <div v-if="pushError" class="alert alert--error">{{ pushError }}</div>
+
+        <div
+          v-if="pushTask && pushBusy"
+          class="campaign-push-progress"
+          role="status"
+          aria-live="polite"
+        >
+          <p class="campaign-push-progress__label">
+            Đang đẩy {{ pushTask.processed }}/{{ pushTask.total }} SĐT
+            <span v-if="pushTask.added"> · đã thêm {{ pushTask.added }}</span>
+            <span v-if="pushTask.duplicateCount"> · trùng {{ pushTask.duplicateCount }}</span>
+          </p>
+          <div class="campaign-push-progress__track">
+            <div
+              class="campaign-push-progress__bar"
+              :style="{ width: `${pushTask.percent || 0}%` }"
+            />
+          </div>
+        </div>
+
         <LoadingState v-if="campaignsLoading" compact label="Đang tải chiến dịch…" />
 
         <template v-else>
@@ -1877,7 +1790,7 @@ onUnmounted(() => {
             :disabled="pushBusy || campaignsLoading || !selectedCampaignId"
             @click="pushToCampaign"
           >
-            <span v-if="pushBusy" class="spinner spinner--sm" aria-hidden="true" />
+            <LoadingGif v-if="pushBusy" size="sm" />
             {{ pushBusy ? 'Đang đẩy…' : 'Đẩy vào' }}
           </button>
         </div>

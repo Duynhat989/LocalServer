@@ -7,6 +7,7 @@ const {
   normalizeCampaignInput,
   normalizePhoneList,
   normalizePhone,
+  phoneDigitVariants,
   generateStepAdd,
 } = require('../utils/campaign');
 const { toPublicPost } = require('../utils/post');
@@ -162,7 +163,7 @@ async function listCampaignPhones(req, res, next) {
       return res.status(400).json({ ok: false, error: 'ID không hợp lệ' });
     }
 
-    const { Campaign, CampaignPhone } = getModels();
+    const { Campaign, CampaignPhone, Post } = getModels();
     const campaign = await Campaign.findByPk(campaignId);
     if (!campaign) {
       return res.status(404).json({ ok: false, error: 'Không tìm thấy chiến dịch' });
@@ -176,6 +177,7 @@ async function listCampaignPhones(req, res, next) {
       limit,
       offset,
     });
+    const displayRows = await backfillCampaignPhoneMetadata(Post, rows);
     const [{ phoneCount, unusedCount }, addedDates, filteredUnused] = await Promise.all([
       getCampaignCounts(CampaignPhone, campaignId),
       listAddedDates(CampaignPhone, campaignId),
@@ -186,7 +188,7 @@ async function listCampaignPhones(req, res, next) {
 
     res.json({
       ok: true,
-      phones: rows.map(toPublicCampaignPhone),
+      phones: displayRows.map(toPublicCampaignPhone),
       total: count,
       filteredUnused,
       limit,
@@ -350,37 +352,242 @@ function pickFilled(current, fallback) {
   return b || null;
 }
 
-async function findLatestPostForPhone(Post, phone) {
-  const normalized = normalizePhone(phone);
-  const candidates = [...new Set([String(phone || '').trim(), normalized].filter(Boolean))];
-  if (!candidates.length) return null;
+const FILTER_JOIN_POST_ALIAS = 'post';
 
-  return Post.findOne({
-    where: { phone: { [Op.in]: candidates } },
-    order: [
-      ['scannedAt', 'DESC'],
-      ['id', 'DESC'],
-    ],
-  });
+function phoneNormSql() {
+  return `REPLACE(REPLACE(REPLACE(REPLACE(TRIM(\`phone\`), ' ', ''), '-', ''), '.', ''), '+', '')`;
 }
 
-/** Bổ sung link bài, nhóm, tên FB từ bài mới nhất nếu client gửi thiếu (vd. tab SĐT load tách). */
-async function enrichCampaignItemFromPost(Post, item) {
-  const hasLink = Boolean(pickFilled(item.postUrl, null));
-  const hasUser = Boolean(pickFilled(item.userName, null));
-  const hasGroup = Boolean(pickFilled(item.groupName, null) || pickFilled(item.groupId, null));
-  if (hasLink && hasUser && hasGroup) return item;
+function phoneNormSqlForAlias(alias) {
+  return `REPLACE(REPLACE(REPLACE(REPLACE(TRIM(\`${alias}\`.\`phone\`), ' ', ''), '-', ''), '.', ''), '+', '')`;
+}
 
-  const post = await findLatestPostForPhone(Post, item.phone);
-  if (!post) return item;
+function phoneDigitsMatchWhere(Post, phone) {
+  const variants = phoneDigitVariants(phone);
+  if (!variants.length) return { id: { [Op.eq]: -1 } };
+  const { sequelize } = Post;
+  const normSql = phoneNormSql();
+  if (variants.length === 1) {
+    return literal(`${normSql} = ${sequelize.escape(variants[0])}`);
+  }
+  return {
+    [Op.or]: variants.map((v) => literal(`${normSql} = ${sequelize.escape(v)}`)),
+  };
+}
+
+function phoneDigitsMatchWhereForAlias(Post, phone, alias = FILTER_JOIN_POST_ALIAS) {
+  const variants = phoneDigitVariants(phone);
+  if (!variants.length) return { id: { [Op.eq]: -1 } };
+  const { sequelize } = Post;
+  const normSql = phoneNormSqlForAlias(alias);
+  if (variants.length === 1) {
+    return literal(`${normSql} = ${sequelize.escape(variants[0])}`);
+  }
+  return {
+    [Op.or]: variants.map((v) => literal(`${normSql} = ${sequelize.escape(v)}`)),
+  };
+}
+
+function isEmptyWhere(where) {
+  if (!where || typeof where !== 'object') return true;
+  return (
+    Object.keys(where).length === 0 &&
+    Object.getOwnPropertySymbols(where).length === 0
+  );
+}
+
+function andWhereClause(base, extra) {
+  if (isEmptyWhere(extra)) return base || {};
+  if (isEmptyWhere(base)) return extra;
+  return { [Op.and]: [base, extra] };
+}
+
+function parseDateOnly(value) {
+  const raw = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  return raw;
+}
+
+function dayStartMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T00:00:00`).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function dayEndMs(dateOnly) {
+  const ms = new Date(`${dateOnly}T23:59:59.999`).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Cùng phạm vi nhóm / ngày quét như màn Posts khi đẩy chiến dịch. */
+function buildListScopeFromPushBody(body = {}) {
+  const and = [];
+  const groupId = String(body.groupId || '').trim();
+  if (groupId) and.push({ groupId });
+
+  const pushedFrom = parseDateOnly(body.pushedFrom || body.from);
+  const pushedTo = parseDateOnly(body.pushedTo || body.to);
+  if (pushedFrom || pushedTo) {
+    const scannedRange = {};
+    let hasRange = false;
+    if (pushedFrom) {
+      const fromMs = dayStartMs(pushedFrom);
+      if (fromMs != null) {
+        scannedRange[Op.gte] = fromMs;
+        hasRange = true;
+      }
+    }
+    if (pushedTo) {
+      const toMs = dayEndMs(pushedTo);
+      if (toMs != null) {
+        scannedRange[Op.lte] = toMs;
+        hasRange = true;
+      }
+    }
+    if (hasRange) and.push({ scannedAt: scannedRange });
+  }
+
+  if (!and.length) return null;
+  if (and.length === 1) return and[0];
+  return { [Op.and]: and };
+}
+
+function parseFilterIdFromBody(body = {}) {
+  const id = Number(body.filterId);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+async function findLatestPostForPhone(Post, phone, { filterId = null, listWhere = null } = {}) {
+  const { FilterPost } = getModels();
+  const phoneWhere = phoneDigitsMatchWhere(Post, phone);
+  const savedFilterId = filterId != null ? Number(filterId) : null;
+  const plainOrder = [
+    ['scannedAt', 'DESC'],
+    ['id', 'DESC'],
+  ];
+
+  const findPlain = (extraWhere) =>
+    Post.findOne({
+      where: andWhereClause(phoneWhere, extraWhere),
+      order: plainOrder,
+    });
+
+  /** Bắt đầu từ filter_posts (filter_id) → JOIN posts — dùng index, không quét cả posts. */
+  const findViaFilterPosts = async (extraWhere) => {
+    if (!savedFilterId) return null;
+    const postPhoneWhere = phoneDigitsMatchWhereForAlias(Post, phone, FILTER_JOIN_POST_ALIAS);
+    const postWhere = andWhereClause(postPhoneWhere, extraWhere);
+
+    const link = await FilterPost.findOne({
+      where: { filterId: savedFilterId },
+      include: [
+        {
+          model: Post,
+          as: FILTER_JOIN_POST_ALIAS,
+          required: true,
+          where: postWhere,
+        },
+      ],
+      order: [
+        [{ model: Post, as: FILTER_JOIN_POST_ALIAS }, 'scannedAt', 'DESC'],
+        [{ model: Post, as: FILTER_JOIN_POST_ALIAS }, 'id', 'DESC'],
+      ],
+      subQuery: false,
+    });
+
+    return link?.post || null;
+  };
+
+  // Ưu tiên: filter_posts + phạm vi → chỉ filter_posts → phạm vi posts → toàn DB
+  let post = await findViaFilterPosts(listWhere);
+  if (post) return post;
+  post = await findViaFilterPosts(null);
+  if (post) return post;
+  if (listWhere) {
+    post = await findPlain(listWhere);
+    if (post) return post;
+  }
+  return findPlain(null);
+}
+
+function campaignRowNeedsMetadata(row) {
+  const pub = toPublicCampaignPhone(row);
+  return (
+    !String(pub.postUrl || '').trim() &&
+    !String(pub.groupName || '').trim() &&
+    !String(pub.userName || '').trim()
+  );
+}
+
+async function backfillCampaignPhoneMetadata(Post, rows, options = {}) {
+  const updated = [];
+  for (const row of rows) {
+    if (!campaignRowNeedsMetadata(row)) {
+      updated.push(row);
+      continue;
+    }
+    const phone = toPublicCampaignPhone(row)?.phone || row.phone;
+    const item = await enrichCampaignItemFromPost(Post, { phone }, options);
+    const hasMeta =
+      pickFilled(item.postUrl, null) ||
+      pickFilled(item.groupName, null) ||
+      pickFilled(item.userName, null);
+    if (!hasMeta) {
+      updated.push(row);
+      continue;
+    }
+    await row.update({
+      postId: pickFilled(item.postId, row.postId),
+      postMessage: item.postMessage ?? row.postMessage,
+      postUrl: pickFilled(item.postUrl, row.postUrl),
+      groupId: pickFilled(item.groupId, row.groupId),
+      groupName: pickFilled(item.groupName, row.groupName),
+      fbUserId: pickFilled(item.fbUserId, row.fbUserId),
+      userName: pickFilled(item.userName, row.userName),
+      userUrl: pickFilled(item.userUrl, row.userUrl),
+      thesame: pickFilled(item.thesame, row.thesame),
+      createdTime: pickFilled(item.createdTime, row.createdTime),
+      scannedAt: item.scannedAt ?? row.scannedAt,
+      keyword: pickFilled(item.keyword, row.keyword),
+    });
+    updated.push(row);
+  }
+  return updated;
+}
+
+/** Client chỉ gửi SĐT — server lấy metadata từ bài mới nhất (ưu tiên trong bộ lọc đang dùng). */
+async function enrichCampaignItemFromPost(Post, item, options = {}) {
+  const post = await findLatestPostForPhone(Post, item.phone, options);
+  if (!post) {
+    return {
+      phone: item.phone,
+      note: item.note ?? null,
+      postId: pickFilled(item.postId, null),
+      postMessage: item.postMessage ?? null,
+      postUrl: pickFilled(item.postUrl, null),
+      groupId: pickFilled(item.groupId, null),
+      groupName: pickFilled(item.groupName, null),
+      fbUserId: pickFilled(item.fbUserId, null),
+      userName: pickFilled(item.userName, null),
+      userUrl: pickFilled(item.userUrl, null),
+      thesame: pickFilled(item.thesame, null),
+      createdTime: pickFilled(item.createdTime, null),
+      scannedAt:
+        item.scannedAt != null && Number.isFinite(Number(item.scannedAt))
+          ? Number(item.scannedAt)
+          : null,
+      keyword: pickFilled(item.keyword, null),
+    };
+  }
 
   const p = toPublicPost(post);
   return {
-    ...item,
+    phone: item.phone,
+    note: item.note ?? null,
     postId: pickFilled(item.postId, p.postId),
-    postMessage: item.postMessage != null && String(item.postMessage).trim()
-      ? item.postMessage
-      : p.postMessage,
+    postMessage:
+      item.postMessage != null && String(item.postMessage).trim()
+        ? item.postMessage
+        : p.postMessage,
     postUrl: pickFilled(item.postUrl, p.postUrl),
     groupId: pickFilled(item.groupId, p.groupId),
     groupName: pickFilled(item.groupName, p.groupName),
@@ -391,10 +598,107 @@ async function enrichCampaignItemFromPost(Post, item) {
     createdTime: pickFilled(item.createdTime, p.created_time),
     scannedAt:
       item.scannedAt != null && Number.isFinite(Number(item.scannedAt))
-        ? item.scannedAt
+        ? Number(item.scannedAt)
         : p.scannedAt,
     keyword: pickFilled(item.keyword, p.keyword),
   };
+}
+
+async function executeAddPhonesForTask(task) {
+  const id = task.campaignId;
+  const items = task._items || [];
+  const enrichOptions = task._enrichOptions || {};
+  const { Campaign, CampaignPhone, Post } = getModels();
+  const campaign = await Campaign.findByPk(id);
+  if (!campaign) {
+    throw new Error('Không tìm thấy chiến dịch');
+  }
+
+  const stepAdd = generateStepAdd(20);
+  let added = 0;
+  const duplicates = [];
+  const created = [];
+
+  for (const rawItem of items) {
+    const phone = rawItem.phone;
+    try {
+      const existed = await CampaignPhone.findOne({
+        where: { campaignId: id, phone },
+      });
+      if (existed) {
+        duplicates.push(phone);
+      } else {
+        const item = await enrichCampaignItemFromPost(Post, rawItem, enrichOptions);
+        try {
+          const row = await CampaignPhone.create({
+            campaignId: id,
+            phone: item.phone,
+            stepAdd,
+            postId: item.postId,
+            postMessage: item.postMessage,
+            postUrl: item.postUrl,
+            groupId: item.groupId,
+            groupName: item.groupName,
+            fbUserId: item.fbUserId,
+            userName: item.userName,
+            userUrl: item.userUrl,
+            thesame: item.thesame,
+            createdTime: item.createdTime,
+            scannedAt: item.scannedAt,
+            keyword: item.keyword,
+            note: item.note,
+            isUsed: false,
+          });
+          created.push(toPublicCampaignPhone(row));
+          added += 1;
+          if (!task.stepAdd) task.stepAdd = stepAdd;
+        } catch (err) {
+          if (err.name === 'SequelizeUniqueConstraintError') {
+            duplicates.push(item.phone);
+          } else {
+            throw err;
+          }
+        }
+      }
+    } finally {
+      task.processed += 1;
+      task.added = added;
+      task.duplicateCount = duplicates.length;
+      task.duplicates = duplicates.slice(0, 200);
+    }
+  }
+
+  const dupCount = duplicates.length;
+  const dupText = dupCount ? ` · ${dupCount} số đã có` : '';
+  await recordActivity({
+    type: 'campaign_phone',
+    action: 'add',
+    userId: task.userId,
+    username: task.username,
+    summary: `Chuyển ${added} SĐT vào “${campaign.name}”${dupText}`,
+    detail: {
+      campaignId: id,
+      campaignName: campaign.name,
+      added,
+      duplicates: dupCount,
+      phones: created.slice(0, 200).map((row) => ({
+        phone: row.phone,
+        userName: row.userName || '',
+        groupName: row.groupName || '',
+      })),
+      duplicatePhones: duplicates.slice(0, 80),
+    },
+  });
+
+  task.status = 'done';
+  task.finishedAt = Date.now();
+  task.added = added;
+  task.duplicateCount = dupCount;
+  task.duplicates = duplicates.slice(0, 200);
+  if (added && !task.stepAdd) task.stepAdd = stepAdd;
+
+  delete task._items;
+  delete task._enrichOptions;
 }
 
 async function addPhones(req, res) {
@@ -409,91 +713,49 @@ async function addPhones(req, res) {
       return res.status(400).json({ ok: false, error: 'Thiếu số điện thoại' });
     }
 
-    const { Campaign, CampaignPhone, Post } = getModels();
+    const { Campaign } = getModels();
     const campaign = await Campaign.findByPk(id);
     if (!campaign) {
       return res.status(404).json({ ok: false, error: 'Không tìm thấy chiến dịch' });
     }
 
-    const stepAdd = generateStepAdd(20);
-    let added = 0;
-    const duplicates = [];
-    const created = [];
+    const filterId = parseFilterIdFromBody(req.body);
+    const listWhere = buildListScopeFromPushBody(req.body);
+    const enrichOptions = { filterId, listWhere };
 
-    for (const rawItem of items) {
-      const item = await enrichCampaignItemFromPost(Post, rawItem);
-      const existed = await CampaignPhone.findOne({
-        where: { campaignId: id, phone: item.phone },
-      });
-      if (existed) {
-        duplicates.push(item.phone);
-        continue;
-      }
-      try {
-        const row = await CampaignPhone.create({
-          campaignId: id,
-          phone: item.phone,
-          stepAdd,
-          postId: item.postId,
-          postMessage: item.postMessage,
-          postUrl: item.postUrl,
-          groupId: item.groupId,
-          groupName: item.groupName,
-          fbUserId: item.fbUserId,
-          userName: item.userName,
-          userUrl: item.userUrl,
-          thesame: item.thesame,
-          createdTime: item.createdTime,
-          scannedAt: item.scannedAt,
-          keyword: item.keyword,
-          note: item.note,
-          isUsed: false,
-        });
-        created.push(toPublicCampaignPhone(row));
-        added += 1;
-      } catch (err) {
-        if (err.name === 'SequelizeUniqueConstraintError') {
-          duplicates.push(item.phone);
-          continue;
-        }
-        throw err;
-      }
-    }
-
-    const { phoneCount, unusedCount } = await getCampaignCounts(CampaignPhone, id);
-
-    const dupCount = duplicates.length;
-    const dupText = dupCount ? ` · ${dupCount} số đã có` : '';
-    await recordActivity({
-      type: 'campaign_phone',
-      action: 'add',
-      userId: req.user?.id,
-      username: req.user?.username,
-      summary: `Chuyển ${added} SĐT vào “${campaign.name}”${dupText}`,
-      detail: {
-        campaignId: id,
-        campaignName: campaign.name,
-        added,
-        duplicates: dupCount,
-        phones: created.slice(0, 200).map((row) => ({
-          phone: row.phone,
-          userName: row.userName || '',
-          groupName: row.groupName || '',
-        })),
-        duplicatePhones: duplicates.slice(0, 80),
-      },
+    const { createCampaignPhonePushTask } = require('../jobs/campaignPhonePushTask');
+    const task = createCampaignPhonePushTask({
+      campaignId: id,
+      campaignName: campaign.name,
+      userId: req.user?.id ?? null,
+      username: req.user?.username ?? null,
+      items,
+      enrichOptions,
     });
 
-    res.status(added ? 201 : 200).json({
+    res.status(202).json({
       ok: true,
-      added,
-      duplicates,
-      stepAdd: added ? stepAdd : null,
-      created,
-      campaign: toPublicCampaign(campaign, phoneCount, unusedCount),
+      async: true,
+      taskId: task.id,
+      total: task.total,
+      status: task.status,
+      task,
     });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message || 'Không thêm được SĐT' });
+  }
+}
+
+async function getPhonePushTask(req, res) {
+  try {
+    const { getCampaignPhonePushTask } = require('../jobs/campaignPhonePushTask');
+    const task = getCampaignPhonePushTask(req.params.taskId, req.user?.id ?? null);
+    if (!task) {
+      return res.status(404).json({ ok: false, error: 'Không tìm thấy task' });
+    }
+    res.json({ ok: true, task });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message || 'Không đọc được task' });
   }
 }
 
@@ -665,6 +927,8 @@ module.exports = {
   createCampaign,
   updateCampaign,
   addPhones,
+  getPhonePushTask,
+  executeAddPhonesForTask,
   removePhone,
   markPhoneUsed,
   markPhonesUsed,

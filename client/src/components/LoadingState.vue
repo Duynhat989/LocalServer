@@ -1,4 +1,6 @@
 <script setup>
+import LoadingGif from './LoadingGif.vue';
+
 defineProps({
   label: {
     type: String,
@@ -28,7 +30,7 @@ defineProps({
       aria-live="polite"
       :aria-label="label || 'Đang tải'"
     >
-      <span class="spinner spinner--lg" aria-hidden="true" />
+      <LoadingGif size="lg" />
       <span v-if="label" class="loading-state__label">{{ label }}</span>
     </div>
   </Teleport>
@@ -43,7 +45,7 @@ defineProps({
     aria-live="polite"
     :aria-label="label || 'Đang tải'"
   >
-    <span class="spinner spinner--lg" aria-hidden="true" />
+    <LoadingGif :size="compact ? 'md' : 'lg'" />
     <span v-if="label" class="loading-state__label">{{ label }}</span>
   </div>
 </template>

@@ -191,6 +191,41 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   }
 }
 
+.loading-gif {
+  object-fit: contain;
+  flex-shrink: 0;
+  display: block;
+  pointer-events: none;
+}
+
+.loading-gif--sm {
+  width: 22px;
+  height: 22px;
+}
+
+.loading-gif--md {
+  width: 40px;
+  height: 40px;
+}
+
+.loading-gif--lg {
+  width: 72px;
+  height: 72px;
+}
+
+.btn .loading-gif--sm {
+  margin-right: 6px;
+}
+
+.loading-state .loading-gif--lg,
+.loading-state .loading-gif--md {
+  margin: 0 auto;
+}
+
+.stat-count-cell__loading .loading-gif--sm {
+  vertical-align: middle;
+}
+
 .loading-state {
   display: flex;
   flex-direction: column;
@@ -2413,6 +2448,50 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   height: 28px;
   padding: 0 10px;
   border-radius: 999px;
+}
+
+.phone-detail-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--orange-deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.phone-detail-link:hover {
+  color: var(--orange);
+}
+
+.campaign-push-progress {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--orange-soft);
+  border: 1px dashed rgba(255, 106, 26, 0.28);
+}
+
+.campaign-push-progress__label {
+  margin: 0 0 10px;
+  font-size: 0.85rem;
+  color: var(--orange-deep);
+}
+
+.campaign-push-progress__track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.65);
+  overflow: hidden;
+}
+
+.campaign-push-progress__bar {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--orange), var(--orange-deep));
+  transition: width 0.25s ease;
 }
 
 .modal-card--wide {

@@ -105,7 +105,10 @@ function parseFilterId(query = {}) {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
-function buildListWhere(query = {}, { keywordMatch = 'fulltext', filterId = null } = {}) {
+function buildListWhere(
+  query = {},
+  { keywordMatch = 'fulltext', filterId = null, skipSavedFilterSubquery = false } = {}
+) {
   const and = [];
   const savedFilterId = filterId ?? parseFilterId(query);
 
@@ -156,7 +159,7 @@ function buildListWhere(query = {}, { keywordMatch = 'fulltext', filterId = null
   }
 
   const paths = parsePaths(query.paths);
-  if (savedFilterId) {
+  if (savedFilterId && !skipSavedFilterSubquery) {
     const { sequelize } = getModels();
     and.push({
       id: {
@@ -165,7 +168,7 @@ function buildListWhere(query = {}, { keywordMatch = 'fulltext', filterId = null
         ),
       },
     });
-  } else if (paths.length) {
+  } else if (!savedFilterId && paths.length) {
     const { sequelize } = getModels();
     const keywordWhere = keywordPathsWhere(paths, sequelize, keywordMatch);
     if (keywordWhere) and.push(keywordWhere);
@@ -372,9 +375,41 @@ async function assembleListWhere(query, keywordMatch, filterId = null) {
   );
 }
 
+/** Bộ lọc lưu: keyword qua JOIN filter_posts — chỉ điều kiện phone/nhóm/ngày/chiến dịch trên posts. */
+async function assemblePostWhereForFilterJoin(query, filterId) {
+  const { campaignId, membership } = parseCampaignMembership(query);
+  return applyCampaignMembershipWhere(
+    buildListWhere(query, { filterId, skipSavedFilterSubquery: true }),
+    campaignId,
+    membership
+  );
+}
+
+const FILTER_JOIN_POST_ALIAS = 'post';
+
+function phoneKeySqlForAlias(alias) {
+  return `COALESCE(NULLIF(TRIM(\`${alias}\`.\`phone\`), ''), '${EMPTY_PHONE_LABEL}')`;
+}
+
+function whereForPhoneKeyOnAlias(sequelize, phoneKey, alias = FILTER_JOIN_POST_ALIAS) {
+  const key = normalizePhoneKey(phoneKey);
+  const expr = phoneKeySqlForAlias(alias);
+  if (key === EMPTY_PHONE_LABEL) {
+    return literal(`NULLIF(TRIM(\`${alias}\`.\`phone\`), '') IS NULL`);
+  }
+  return literal(`${expr} = ${sequelize.escape(key)}`);
+}
+
 function parseLoadPhase(query = {}) {
   const raw = String(query.loadPhase || 'all').trim().toLowerCase();
-  if (raw === 'content' || raw === 'stats' || raw === 'phone-row' || raw === 'bodies') {
+  if (
+    raw === 'content' ||
+    raw === 'stats' ||
+    raw === 'phone-row' ||
+    raw === 'phone-rows' ||
+    raw === 'phone-counts' ||
+    raw === 'bodies'
+  ) {
     return raw;
   }
   return 'all';
@@ -388,6 +423,20 @@ function parsePostIdsQuery(query = {}) {
     .map((n) => Number(n))
     .filter((id) => Number.isFinite(id) && id > 0)
     .slice(0, 500);
+}
+
+function parsePhoneKeysQuery(query = {}) {
+  const bulk = String(query.phoneKeys || '').trim();
+  if (bulk) {
+    return bulk
+      .split(',')
+      .map((s) => normalizePhoneKey(s.trim()))
+      .filter(Boolean)
+      .slice(0, 500);
+  }
+  const single = String(query.phoneKey || '').trim();
+  if (single) return [normalizePhoneKey(single)];
+  return [];
 }
 
 async function listPhoneGroupsPageMinimal(Post, where, limit, offset) {
@@ -423,15 +472,141 @@ async function listPhoneGroupsPageMinimal(Post, where, limit, offset) {
   }));
 }
 
-async function fetchPhoneRowDetail(Post, where, phoneKey) {
+async function fetchPhoneCountsBatchViaFilterPosts(Post, filterId, postWhere, phoneKeys) {
+  const { FilterPost } = getModels();
   const { sequelize } = Post;
-  const key = normalizePhoneKey(phoneKey);
-  const rowWhere = andWhere(where, whereForPhoneKey(sequelize, key));
-  const count = await Post.count({ where: rowWhere });
-  const [withNames] = await attachUserNamesToPhoneGroups(Post, where, [
-    { phone: key, userNames: [] },
-  ]);
+  const keys = [
+    ...new Set(
+      phoneKeys.map((k) => normalizePhoneKey(String(k || '').trim())).filter(Boolean)
+    ),
+  ];
+  if (!keys.length) return [];
 
+  const phoneExpr = phoneKeySqlForAlias(FILTER_JOIN_POST_ALIAS);
+  const keyConditions = keys.map((k) => whereForPhoneKeyOnAlias(sequelize, k));
+  const includeWhere = andWhere(postWhere, { [Op.or]: keyConditions });
+
+  const rows = await FilterPost.findAll({
+    attributes: [
+      [literal(phoneExpr), 'phone'],
+      [fn('COUNT', col('FilterPost.post_id')), 'count'],
+    ],
+    where: { filterId },
+    include: [
+      {
+        model: Post,
+        as: 'post',
+        attributes: [],
+        required: true,
+        where: includeWhere,
+      },
+    ],
+    group: [literal(phoneExpr)],
+    raw: true,
+    subQuery: false,
+  });
+
+  const countByPhone = new Map();
+  for (const row of rows) {
+    countByPhone.set(normalizePhoneKey(row.phone), Number(row.count) || 0);
+  }
+
+  return keys.map((phone) => ({
+    phone,
+    count: countByPhone.get(phone) ?? 0,
+  }));
+}
+
+async function fetchPhoneCountsBatch(Post, where, phoneKeys, options = {}) {
+  const keys = [
+    ...new Set(
+      phoneKeys.map((k) => normalizePhoneKey(String(k || '').trim())).filter(Boolean)
+    ),
+  ];
+  if (!keys.length) return [];
+
+  const savedFilterId = options.filterId ?? null;
+  if (savedFilterId && options.query) {
+    const postApplied = await assemblePostWhereForFilterJoin(options.query, savedFilterId);
+    return fetchPhoneCountsBatchViaFilterPosts(
+      Post,
+      savedFilterId,
+      postApplied.where,
+      keys
+    );
+  }
+
+  const { sequelize } = Post;
+  const keyConditions = keys.map((k) => whereForPhoneKey(sequelize, k));
+  const rowWhere = andWhere(where, { [Op.or]: keyConditions });
+
+  const rows = await Post.findAll({
+    attributes: [
+      [literal(PHONE_KEY_SQL), 'phone'],
+      [fn('COUNT', col('id')), 'count'],
+    ],
+    where: rowWhere,
+    group: [literal(PHONE_KEY_SQL)],
+    raw: true,
+  });
+
+  const countByPhone = new Map();
+  for (const row of rows) {
+    countByPhone.set(normalizePhoneKey(row.phone), Number(row.count) || 0);
+  }
+
+  return keys.map((phone) => ({
+    phone,
+    count: countByPhone.get(phone) ?? 0,
+  }));
+}
+
+async function countDistinctPhonesViaFilterPosts(Post, filterId, postWhere) {
+  const { FilterPost } = getModels();
+  const phoneExpr = phoneKeySqlForAlias(FILTER_JOIN_POST_ALIAS);
+  const row = await FilterPost.findOne({
+    attributes: [[literal(`COUNT(DISTINCT ${phoneExpr})`), 'cnt']],
+    where: { filterId },
+    include: [
+      {
+        model: Post,
+        as: 'post',
+        attributes: [],
+        required: true,
+        where: postWhere,
+      },
+    ],
+    raw: true,
+    subQuery: false,
+  });
+  return Number(row?.cnt) || 0;
+}
+
+async function countPostsViaFilterPosts(Post, filterId, postWhere) {
+  const { FilterPost } = getModels();
+  return FilterPost.count({
+    where: { filterId },
+    include: [
+      {
+        model: Post,
+        as: 'post',
+        attributes: [],
+        required: true,
+        where: postWhere,
+      },
+    ],
+    distinct: true,
+    col: 'post_id',
+  });
+}
+
+async function fetchPhoneRowDetail(Post, where, phoneKey) {
+  const key = normalizePhoneKey(phoneKey);
+  const [countRow] = await fetchPhoneCountsBatch(Post, where, [key]);
+  const count = countRow?.count ?? 0;
+
+  const { sequelize } = Post;
+  const rowWhere = andWhere(where, whereForPhoneKey(sequelize, key));
   const sampleRow = await Post.findOne({
     where: rowWhere,
     order: [
@@ -444,9 +619,23 @@ async function fetchPhoneRowDetail(Post, where, phoneKey) {
   return {
     phone: key,
     count,
-    userNames: withNames?.userNames || [],
+    userNames: [],
     samplePost,
   };
+}
+
+async function respondPhoneCountsBatch(
+  Post,
+  where,
+  phoneKeys,
+  respondPayload,
+  { filterId = null, query = null } = {}
+) {
+  const phoneCounts = await fetchPhoneCountsBatch(Post, where, phoneKeys, {
+    filterId,
+    query,
+  });
+  return respondPayload({ view: 'phone', loadPhase: 'phone-counts', phoneCounts });
 }
 
 async function fetchPostBodies(Post, ids) {
@@ -480,6 +669,21 @@ async function fetchPostsListPayload(
 
   if (view === 'phone') {
     if (loadPhase === 'stats') {
+      const savedFilterId = parseFilterId(req.query);
+      if (savedFilterId) {
+        const postApplied = await assemblePostWhereForFilterJoin(req.query, savedFilterId);
+        const postWhere = postApplied.where;
+        const [total, matchedPostCount] = await Promise.all([
+          countDistinctPhonesViaFilterPosts(Post, savedFilterId, postWhere),
+          countPostsViaFilterPosts(Post, savedFilterId, postWhere),
+        ]);
+        return {
+          view: 'phone',
+          total,
+          matchedPostCount,
+          loadPhase: 'stats',
+        };
+      }
       const [total, matchedPostCount] = await Promise.all([
         countDistinctPhones(Post, where),
         Post.count({ where }),
@@ -638,6 +842,28 @@ async function listPosts(req, res, next) {
         filterSync,
       });
     };
+
+    if (loadPhase === 'phone-counts' || loadPhase === 'phone-rows') {
+      const phoneKeys = parsePhoneKeysQuery(req.query);
+      if (!phoneKeys.length) {
+        return res.status(400).json({ ok: false, error: 'Thiếu phoneKeys' });
+      }
+      try {
+        return await respondPhoneCountsBatch(Post, where, phoneKeys, respondPayload, {
+          filterId: savedFilterId,
+          query: req.query,
+        });
+      } catch (err) {
+        if (savedFilterId || !isFtsResultCacheError(err)) throw err;
+        keywordMatch = 'substr';
+        campaignApplied = await assembleListWhere(req.query, keywordMatch, savedFilterId);
+        where = campaignApplied.where;
+        return await respondPhoneCountsBatch(Post, where, phoneKeys, respondPayload, {
+          filterId: savedFilterId,
+          query: req.query,
+        });
+      }
+    }
 
     if (loadPhase === 'phone-row') {
       const phoneKey = String(req.query.phoneKey || '').trim();

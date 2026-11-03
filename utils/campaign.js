@@ -9,6 +9,20 @@ function normalizePhone(input) {
     .trim();
 }
 
+/** Các dạng số VN hay lệch giữa posts và chiến dịch (0… vs 84…). */
+function phoneDigitVariants(input) {
+  const digits = normalizePhone(input);
+  if (!digits) return [];
+  const set = new Set([digits]);
+  if (digits.startsWith('0') && digits.length >= 10) {
+    set.add(`84${digits.slice(1)}`);
+  }
+  if (digits.startsWith('84') && digits.length >= 11) {
+    set.add(`0${digits.slice(2)}`);
+  }
+  return [...set];
+}
+
 function generateStepAdd(length = 20) {
   const bytes = crypto.randomBytes(length);
   let out = '';
@@ -159,6 +173,7 @@ function normalizePhoneList(body = {}) {
 module.exports = {
   CAMPAIGN_STATUSES,
   normalizePhone,
+  phoneDigitVariants,
   generateStepAdd,
   toPublicCampaign,
   toPublicCampaignPhone,

@@ -5,6 +5,11 @@ const { requireAuth, requireStaff } = require('../middleware/auth');
 const router = express.Router();
 
 router.get('/', requireAuth, campaignController.listCampaigns);
+router.get(
+  '/phone-push-tasks/:taskId',
+  requireAuth,
+  campaignController.getPhonePushTask
+);
 router.get('/:id', requireAuth, campaignController.getCampaign);
 router.get('/:id/phones', requireAuth, campaignController.listCampaignPhones);
 router.get('/:id/steps', requireAuth, campaignController.listCampaignSteps);

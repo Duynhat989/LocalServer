@@ -29,7 +29,6 @@ function toPublicPostLite(post) {
     ...row,
     postMessage: null,
     keyword: null,
-    bodyLoading: true,
   };
 }
 
