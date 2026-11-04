@@ -826,7 +826,16 @@ function finishPushTask(task) {
   }
   const parts = [];
   if (task.added) parts.push(`Đã thêm ${task.added} SĐT`);
-  if (task.duplicateCount) parts.push(`Trùng bỏ qua: ${task.duplicateCount}`);
+  if (task.duplicateCount) {
+    const sample = Array.isArray(task.alreadyInCampaign)
+      ? task.alreadyInCampaign.filter(Boolean).slice(0, 5)
+      : [];
+    let dupMsg = `Đã có trong chiến dịch: ${task.duplicateCount} SĐT`;
+    if (sample.length) {
+      dupMsg += ` (${sample.join(', ')}${task.duplicateCount > sample.length ? '…' : ''})`;
+    }
+    parts.push(dupMsg);
+  }
   if (task.stepAdd) parts.push(`step_add ${task.stepAdd}`);
   showToast(parts.join(' · ') || 'Không có SĐT mới');
   showCampaignModal.value = false;
@@ -1812,9 +1821,24 @@ onUnmounted(() => {
           aria-live="polite"
         >
           <p class="campaign-push-progress__label">
-            Đang đẩy {{ pushTask.processed }}/{{ pushTask.total }} SĐT
-            <span v-if="pushTask.added"> · đã thêm {{ pushTask.added }}</span>
-            <span v-if="pushTask.duplicateCount"> · trùng {{ pushTask.duplicateCount }}</span>
+            <template v-if="pushTask.phase === 'collecting'">
+              Đang lấy danh sách SĐT theo bộ lọc…
+            </template>
+            <template v-else>
+              Đang đẩy {{ pushTask.processed }}/{{ pushTask.total || '…' }} SĐT
+              <span v-if="pushTask.added"> · đã thêm {{ pushTask.added }}</span>
+              <span v-if="pushTask.duplicateCount">
+                · đã có trong CD {{ pushTask.duplicateCount }}
+              </span>
+            </template>
+          </p>
+          <p
+            v-if="pushTask.duplicateCount && pushTask.alreadyInCampaign?.length"
+            class="campaign-push-progress__dup muted"
+          >
+            SĐT đã có:
+            {{ pushTask.alreadyInCampaign.slice(0, 8).join(', ') }}
+            <span v-if="pushTask.duplicateCount > 8">… +{{ pushTask.duplicateCount - 8 }}</span>
           </p>
           <div class="campaign-push-progress__track">
             <div

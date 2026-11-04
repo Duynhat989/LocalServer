@@ -13,19 +13,31 @@ function pruneTasks() {
 }
 
 function toPublicTask(task) {
+  const total = Number(task.total) || 0;
+  const processed = Number(task.processed) || 0;
+  let percent = 0;
+  if (total > 0) {
+    percent = Math.min(100, Math.round((processed / total) * 100));
+  } else if (task.phase === 'collecting') {
+    percent = 0;
+  }
+
   return {
     id: task.id,
     campaignId: task.campaignId,
     campaignName: task.campaignName,
     status: task.status,
-    total: task.total,
-    processed: task.processed,
+    phase: task.phase || (task.status === 'running' ? 'pushing' : null),
+    total,
+    processed,
     added: task.added,
     duplicateCount: task.duplicateCount,
-    duplicates: task.duplicates.slice(0, 100),
+    alreadyInCampaign: Array.isArray(task.alreadyInCampaign)
+      ? task.alreadyInCampaign.slice(0, 30)
+      : [],
     stepAdd: task.stepAdd,
     error: task.error,
-    percent: task.total ? Math.min(100, Math.round((task.processed / task.total) * 100)) : 0,
+    percent,
     createdAt: task.createdAt,
     finishedAt: task.finishedAt,
   };
@@ -61,7 +73,8 @@ function createCampaignPhonePushTask(payload) {
     processed: 0,
     added: 0,
     duplicateCount: 0,
-    duplicates: [],
+    alreadyInCampaign: [],
+    phase: 'pending',
     stepAdd: null,
     error: null,
     createdAt: Date.now(),

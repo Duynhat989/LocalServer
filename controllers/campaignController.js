@@ -456,7 +456,11 @@ function parseFilterIdFromBody(body = {}) {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
-async function findLatestPostForPhone(Post, phone, { filterId = null, listWhere = null } = {}) {
+async function findLatestPostForPhone(
+  Post,
+  phone,
+  { filterId = null, listWhere = null, filterPostsOnly = false } = {}
+) {
   const { FilterPost } = getModels();
   const phoneWhere = phoneDigitsMatchWhere(Post, phone);
   const savedFilterId = filterId != null ? Number(filterId) : null;
@@ -471,7 +475,7 @@ async function findLatestPostForPhone(Post, phone, { filterId = null, listWhere 
       order: plainOrder,
     });
 
-  /** Bắt đầu từ filter_posts (filter_id) → JOIN posts — dùng index, không quét cả posts. */
+  /** Bắt đầu từ filter_posts (filter_id) → JOIN posts — bài mới nhất trong bộ lọc. */
   const findViaFilterPosts = async (extraWhere) => {
     if (!savedFilterId) return null;
     const postPhoneWhere = phoneDigitsMatchWhereForAlias(Post, phone, FILTER_JOIN_POST_ALIAS);
@@ -496,6 +500,12 @@ async function findLatestPostForPhone(Post, phone, { filterId = null, listWhere 
 
     return link?.post || null;
   };
+
+  if (filterPostsOnly && savedFilterId) {
+    let post = await findViaFilterPosts(listWhere);
+    if (post) return post;
+    return findViaFilterPosts(null);
+  }
 
   // Ưu tiên: filter_posts + phạm vi → chỉ filter_posts → phạm vi posts → toàn DB
   let post = await findViaFilterPosts(listWhere);
@@ -607,46 +617,43 @@ async function enrichCampaignItemFromPost(Post, item, options = {}) {
 async function executeAddPhonesForTask(task) {
   const id = task.campaignId;
   const enrichOptions = task._enrichOptions || {};
+  if (parseFilterIdFromBody({ filterId: enrichOptions.filterId })) {
+    enrichOptions.filterPostsOnly = true;
+  }
   const { Campaign, CampaignPhone, Post } = getModels();
   const campaign = await Campaign.findByPk(id);
   if (!campaign) {
     throw new Error('Không tìm thấy chiến dịch');
   }
 
-  if (task._pushAll) {
-    const { collectPhonesForCampaignPush } = require('./postController');
-    const { items, total } = await collectPhonesForCampaignPush(task._listQuery || {});
-    task._items = items;
-    task.total = total;
-    task.processed = 0;
-    delete task._pushAll;
-    delete task._listQuery;
-  }
-
-  const items = task._items || [];
-  if (!items.length) {
-    task.status = 'done';
-    task.finishedAt = Date.now();
-    task.added = 0;
-    task.duplicateCount = 0;
-    delete task._items;
-    delete task._enrichOptions;
-    return;
-  }
-
   const stepAdd = generateStepAdd(20);
   let added = 0;
-  const duplicates = [];
+  const duplicatePhones = [];
   const created = [];
 
-  for (const rawItem of items) {
+  const existingInCampaign = new Set(
+    (
+      await CampaignPhone.findAll({
+        where: { campaignId: id },
+        attributes: ['phone'],
+        raw: true,
+      })
+    )
+      .map((row) => normalizePhone(row.phone))
+      .filter(Boolean)
+  );
+
+  const syncDuplicateReport = () => {
+    task.duplicateCount = duplicatePhones.length;
+    task.alreadyInCampaign = duplicatePhones.slice(0, 30);
+  };
+
+  const processOnePhone = async (rawItem) => {
     const phone = rawItem.phone;
     try {
-      const existed = await CampaignPhone.findOne({
-        where: { campaignId: id, phone },
-      });
-      if (existed) {
-        duplicates.push(phone);
+      if (existingInCampaign.has(phone)) {
+        duplicatePhones.push(phone);
+        syncDuplicateReport();
       } else {
         const item = await enrichCampaignItemFromPost(Post, rawItem, enrichOptions);
         try {
@@ -671,10 +678,13 @@ async function executeAddPhonesForTask(task) {
           });
           created.push(toPublicCampaignPhone(row));
           added += 1;
+          existingInCampaign.add(item.phone);
           if (!task.stepAdd) task.stepAdd = stepAdd;
         } catch (err) {
           if (err.name === 'SequelizeUniqueConstraintError') {
-            duplicates.push(item.phone);
+            duplicatePhones.push(item.phone);
+            existingInCampaign.add(item.phone);
+            syncDuplicateReport();
           } else {
             throw err;
           }
@@ -683,38 +693,72 @@ async function executeAddPhonesForTask(task) {
     } finally {
       task.processed += 1;
       task.added = added;
-      task.duplicateCount = duplicates.length;
-      task.duplicates = duplicates.slice(0, 200);
     }
+  };
+
+  task.processed = 0;
+  task.phase = 'pushing';
+
+  if (task._pushAll) {
+    const listQuery = task._listQuery || {};
+    task.phase = 'collecting';
+    const savedFilterId = parseFilterIdFromBody(listQuery);
+
+    const {
+      forEachCampaignPushPhone,
+      forEachCampaignPushPhoneFromFilterPosts,
+    } = require('./postController');
+    const iteratePhones = savedFilterId
+      ? forEachCampaignPushPhoneFromFilterPosts
+      : forEachCampaignPushPhone;
+
+    await iteratePhones(listQuery, processOnePhone, {
+      onTotalReady: (total) => {
+        task.total = total;
+        task.phase = 'pushing';
+      },
+    });
+    delete task._pushAll;
+    delete task._listQuery;
+  } else {
+    const items = task._items || [];
+    task.total = items.length;
+    for (const rawItem of items) {
+      await processOnePhone(rawItem);
+    }
+    delete task._items;
   }
 
-  const dupCount = duplicates.length;
+  const dupCount = duplicatePhones.length;
   const dupText = dupCount ? ` · ${dupCount} số đã có` : '';
-  await recordActivity({
-    type: 'campaign_phone',
-    action: 'add',
-    userId: task.userId,
-    username: task.username,
-    summary: `Chuyển ${added} SĐT vào “${campaign.name}”${dupText}`,
-    detail: {
-      campaignId: id,
-      campaignName: campaign.name,
-      added,
-      duplicates: dupCount,
-      phones: created.slice(0, 200).map((row) => ({
-        phone: row.phone,
-        userName: row.userName || '',
-        groupName: row.groupName || '',
-      })),
-      duplicatePhones: duplicates.slice(0, 80),
-    },
-  });
+  if (added || dupCount) {
+    await recordActivity({
+      type: 'campaign_phone',
+      action: 'add',
+      userId: task.userId,
+      username: task.username,
+      summary: `Chuyển ${added} SĐT vào “${campaign.name}”${dupText}`,
+      detail: {
+        campaignId: id,
+        campaignName: campaign.name,
+        added,
+        duplicateCount: dupCount,
+        phones: created.slice(0, 200).map((row) => ({
+          phone: row.phone,
+          userName: row.userName || '',
+          groupName: row.groupName || '',
+        })),
+        alreadyInCampaign: duplicatePhones.slice(0, 80),
+      },
+    });
+  }
 
   task.status = 'done';
   task.finishedAt = Date.now();
   task.added = added;
   task.duplicateCount = dupCount;
-  task.duplicates = duplicates.slice(0, 200);
+  task.alreadyInCampaign = duplicatePhones.slice(0, 30);
+  task.phase = 'done';
   if (added && !task.stepAdd) task.stepAdd = stepAdd;
 
   delete task._items;
@@ -761,6 +805,10 @@ async function addPhones(req, res) {
     const filterId = parseFilterIdFromBody(req.body);
     const listWhere = buildListScopeFromPushBody(req.body);
     const enrichOptions = { filterId, listWhere };
+    // Chọn từng SĐT + bộ lọc lưu: chỉ bài mới nhất trong filter_posts (giống đẩy tất cả).
+    if (filterId) {
+      enrichOptions.filterPostsOnly = true;
+    }
 
     const { createCampaignPhonePushTask } = require('../jobs/campaignPhonePushTask');
     const task = createCampaignPhonePushTask({

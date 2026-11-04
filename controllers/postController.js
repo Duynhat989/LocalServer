@@ -1071,13 +1071,101 @@ async function resolveWhereForPhoneCollect(query = {}) {
   }
 }
 
-/** Toàn bộ SĐT khớp bộ lọc (không theo limit/offset trang Posts). */
-async function collectPhonesForCampaignPush(query = {}) {
+async function listPhoneGroupsPageFromFilterPosts(
+  Post,
+  filterId,
+  postWhere,
+  limit,
+  offset
+) {
+  const { FilterPost } = getModels();
+  const phoneExpr = phoneKeySqlForAlias(FILTER_JOIN_POST_ALIAS);
+
+  const rows = await FilterPost.findAll({
+    attributes: [
+      [literal(phoneExpr), 'phone'],
+      [literal('MAX(`post`.`scanned_at`)'), 'latestScannedAt'],
+    ],
+    where: { filterId },
+    include: [
+      {
+        model: Post,
+        as: FILTER_JOIN_POST_ALIAS,
+        attributes: [],
+        required: true,
+        where: postWhere,
+      },
+    ],
+    group: [literal(phoneExpr)],
+    order: [[literal('latestScannedAt'), 'DESC']],
+    limit,
+    offset,
+    raw: true,
+    subQuery: false,
+  });
+
+  return rows.map((row) => ({
+    phone: normalizePhoneKey(row.phone),
+  }));
+}
+
+/**
+ * Đẩy tất cả: danh sách SĐT từ filter_posts (filter_id) → JOIN posts.
+ * Nhanh hơn quét cả bảng posts + IN (SELECT post_id …).
+ */
+async function forEachCampaignPushPhoneFromFilterPosts(query, onPhone, { onTotalReady } = {}) {
+  const savedFilterId = parseFilterId(query);
+  if (!savedFilterId) {
+    return forEachCampaignPushPhone(query, onPhone, { onTotalReady });
+  }
+
+  const { Post } = getModels();
+  const postApplied = await assemblePostWhereForFilterJoin(query, savedFilterId);
+  const postWhere = postApplied.where;
+  const distinctTotal = await countDistinctPhonesViaFilterPosts(
+    Post,
+    savedFilterId,
+    postWhere
+  );
+  if (typeof onTotalReady === 'function') {
+    onTotalReady(distinctTotal);
+  }
+
+  const seen = new Set();
+  const batchSize = 500;
+
+  for (let offset = 0; offset < distinctTotal; offset += batchSize) {
+    const groups = await listPhoneGroupsPageFromFilterPosts(
+      Post,
+      savedFilterId,
+      postWhere,
+      batchSize,
+      offset
+    );
+    if (!groups.length) break;
+    for (const g of groups) {
+      if (g.phone === EMPTY_PHONE_LABEL) continue;
+      const phone = normalizePhone(g.phone);
+      if (!phone || seen.has(phone)) continue;
+      seen.add(phone);
+      await onPhone({ phone });
+    }
+    if (groups.length < batchSize) break;
+  }
+
+  return distinctTotal;
+}
+
+/** Duyệt từng SĐT khớp bộ lọc — cập nhật tiến độ theo từng số, không gom hết vào RAM. */
+async function forEachCampaignPushPhone(query, onPhone, { onTotalReady } = {}) {
   const { Post } = getModels();
   const where = await resolveWhereForPhoneCollect(query);
   const distinctTotal = await countDistinctPhones(Post, where);
+  if (typeof onTotalReady === 'function') {
+    onTotalReady(distinctTotal);
+  }
+
   const seen = new Set();
-  const items = [];
   const batchSize = 500;
 
   for (let offset = 0; offset < distinctTotal; offset += batchSize) {
@@ -1088,12 +1176,12 @@ async function collectPhonesForCampaignPush(query = {}) {
       const phone = normalizePhone(g.phone);
       if (!phone || seen.has(phone)) continue;
       seen.add(phone);
-      items.push({ phone });
+      await onPhone({ phone });
     }
     if (groups.length < batchSize) break;
   }
 
-  return { items, total: items.length, distinctTotal };
+  return distinctTotal;
 }
 
 module.exports = {
@@ -1102,5 +1190,6 @@ module.exports = {
   createPostsBulk,
   checkPostsExist,
   deletePostsByGroup,
-  collectPhonesForCampaignPush,
+  forEachCampaignPushPhone,
+  forEachCampaignPushPhoneFromFilterPosts,
 };

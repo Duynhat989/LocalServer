@@ -2480,6 +2480,12 @@ h1, h2, h3, h4, h5, h6, strong, b, th, label, button {
   color: var(--orange-deep);
 }
 
+.campaign-push-progress__dup {
+  margin: 0 0 10px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
 .campaign-push-progress__track {
   height: 8px;
   border-radius: 999px;
