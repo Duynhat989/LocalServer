@@ -10,7 +10,9 @@ const {
   phoneDigitVariants,
   generateStepAdd,
 } = require('../utils/campaign');
-const { toPublicPost } = require('../utils/post');
+const { toPublicPost, POST_LIST_LITE_ATTRIBUTES } = require('../utils/post');
+
+const CAMPAIGN_PUSH_POST_ATTRIBUTES = [...POST_LIST_LITE_ATTRIBUTES, 'postMessage', 'keyword'];
 
 const PHONE_LIMIT_DEFAULT = 100;
 const PHONE_LIMIT_MAX = 10000;
@@ -564,9 +566,7 @@ async function backfillCampaignPhoneMetadata(Post, rows, options = {}) {
   return updated;
 }
 
-/** Client chỉ gửi SĐT — server lấy metadata từ bài mới nhất (ưu tiên trong bộ lọc đang dùng). */
-async function enrichCampaignItemFromPost(Post, item, options = {}) {
-  const post = await findLatestPostForPhone(Post, item.phone, options);
+function campaignItemFromPostRow(item, post) {
   if (!post) {
     return {
       phone: item.phone,
@@ -614,12 +614,30 @@ async function enrichCampaignItemFromPost(Post, item, options = {}) {
   };
 }
 
+/** Client chỉ gửi SĐT — server lấy metadata từ bài mới nhất (ưu tiên trong bộ lọc đang dùng). */
+async function enrichCampaignItemFromPost(Post, item, options = {}) {
+  const post = await findLatestPostForPhone(Post, item.phone, options);
+  return campaignItemFromPostRow(item, post);
+}
+
+const CAMPAIGN_PUSH_BATCH_SIZE = 500;
+
+async function resolveFilterPostsWhereForPush(enrichOptions, listQuery) {
+  const filterId = parseFilterIdFromBody({ filterId: enrichOptions.filterId });
+  if (!filterId) return null;
+  const { assemblePostWhereForFilterJoin } = require('./postController');
+  const applied = await assemblePostWhereForFilterJoin(listQuery || {}, filterId);
+  return andWhereClause(applied.where, enrichOptions.listWhere);
+}
+
 async function executeAddPhonesForTask(task) {
   const id = task.campaignId;
   const enrichOptions = task._enrichOptions || {};
-  if (parseFilterIdFromBody({ filterId: enrichOptions.filterId })) {
+  const savedFilterId = parseFilterIdFromBody({ filterId: enrichOptions.filterId });
+  if (savedFilterId) {
     enrichOptions.filterPostsOnly = true;
   }
+  const useFilterPostsBatch = Boolean(savedFilterId && enrichOptions.filterPostsOnly);
   const { Campaign, CampaignPhone, Post } = getModels();
   const campaign = await Campaign.findByPk(id);
   if (!campaign) {
@@ -646,6 +664,116 @@ async function executeAddPhonesForTask(task) {
   const syncDuplicateReport = () => {
     task.duplicateCount = duplicatePhones.length;
     task.alreadyInCampaign = duplicatePhones.slice(0, 30);
+  };
+
+  let filterPostsPostWhere = null;
+  if (useFilterPostsBatch) {
+    filterPostsPostWhere = await resolveFilterPostsWhereForPush(
+      enrichOptions,
+      task._listQuery || {}
+    );
+  }
+
+  const {
+    forEachCampaignPushPhone,
+    forEachCampaignPushPhoneFromFilterPosts,
+    fetchLatestPostsBatchViaFilterPosts,
+  } = require('./postController');
+
+  const processPhoneBatchFilterPosts = async (rawItems) => {
+    if (!rawItems.length) return;
+
+    const candidates = [];
+    for (const rawItem of rawItems) {
+      const phone = rawItem.phone;
+      if (existingInCampaign.has(phone)) {
+        duplicatePhones.push(phone);
+        syncDuplicateReport();
+      } else {
+        candidates.push(rawItem);
+      }
+    }
+
+    let postByPhone = new Map();
+    if (candidates.length) {
+      const withPk = candidates.filter((r) => r.postPk);
+      const needLookup = candidates.filter((r) => !r.postPk);
+      const postByPk = new Map();
+
+      const pkList = [
+        ...new Set(
+          withPk.map((r) => Number(r.postPk)).filter((n) => Number.isFinite(n) && n > 0)
+        ),
+      ];
+      if (pkList.length) {
+        const posts = await Post.findAll({
+          where: { id: { [Op.in]: pkList } },
+          attributes: CAMPAIGN_PUSH_POST_ATTRIBUTES,
+        });
+        for (const p of posts) postByPk.set(p.id, p);
+      }
+
+      for (const raw of withPk) {
+        const post = postByPk.get(Number(raw.postPk));
+        if (post) postByPhone.set(raw.phone, post);
+      }
+
+      if (needLookup.length) {
+        const extra = await fetchLatestPostsBatchViaFilterPosts(
+          Post,
+          savedFilterId,
+          filterPostsPostWhere,
+          needLookup.map((r) => r.phone)
+        );
+        postByPhone = new Map([...postByPhone, ...extra]);
+      }
+    }
+
+    const insertRows = [];
+    for (const rawItem of candidates) {
+      const item = campaignItemFromPostRow(rawItem, postByPhone.get(rawItem.phone) || null);
+      insertRows.push({
+        campaignId: id,
+        phone: item.phone,
+        stepAdd,
+        postId: item.postId,
+        postMessage: item.postMessage,
+        postUrl: item.postUrl,
+        groupId: item.groupId,
+        groupName: item.groupName,
+        fbUserId: item.fbUserId,
+        userName: item.userName,
+        userUrl: item.userUrl,
+        thesame: item.thesame,
+        createdTime: item.createdTime,
+        scannedAt: item.scannedAt,
+        keyword: item.keyword,
+        note: item.note,
+        isUsed: false,
+      });
+    }
+
+    if (insertRows.length) {
+      await CampaignPhone.bulkCreate(insertRows, {
+        validate: false,
+        ignoreDuplicates: true,
+      });
+      for (const row of insertRows) {
+        existingInCampaign.add(row.phone);
+        added += 1;
+        if (created.length < 200) {
+          created.push({
+            phone: row.phone,
+            userName: row.userName || '',
+            groupName: row.groupName || '',
+          });
+        }
+      }
+      if (added && !task.stepAdd) task.stepAdd = stepAdd;
+    }
+
+    task.processed += rawItems.length;
+    task.added = added;
   };
 
   const processOnePhone = async (rawItem) => {
@@ -700,31 +828,44 @@ async function executeAddPhonesForTask(task) {
   task.phase = 'pushing';
 
   if (task._pushAll) {
-    const listQuery = task._listQuery || {};
-    task.phase = 'collecting';
-    const savedFilterId = parseFilterIdFromBody(listQuery);
-
-    const {
-      forEachCampaignPushPhone,
-      forEachCampaignPushPhoneFromFilterPosts,
-    } = require('./postController');
+    const estimated = Math.max(0, Number(task.total) || 0);
+    const listQuery = {
+      ...(task._listQuery || {}),
+      _pushEstimatedTotal: estimated,
+    };
+    task.phase = useFilterPostsBatch && estimated > 0 ? 'pushing' : 'collecting';
     const iteratePhones = savedFilterId
       ? forEachCampaignPushPhoneFromFilterPosts
       : forEachCampaignPushPhone;
 
-    await iteratePhones(listQuery, processOnePhone, {
+    const iterateOpts = {
       onTotalReady: (total) => {
-        task.total = total;
+        task.total = Math.max(0, Number(total) || 0);
         task.phase = 'pushing';
       },
-    });
+      pushBatchSize: CAMPAIGN_PUSH_BATCH_SIZE,
+    };
+    if (useFilterPostsBatch) {
+      iterateOpts.onPhoneBatch = processPhoneBatchFilterPosts;
+    }
+
+    await iteratePhones(listQuery, processOnePhone, iterateOpts);
+    if (task.processed > 0) {
+      task.total = Math.max(Number(task.total) || 0, task.processed);
+    }
     delete task._pushAll;
     delete task._listQuery;
   } else {
     const items = task._items || [];
     task.total = items.length;
-    for (const rawItem of items) {
-      await processOnePhone(rawItem);
+    if (useFilterPostsBatch) {
+      for (let i = 0; i < items.length; i += CAMPAIGN_PUSH_BATCH_SIZE) {
+        await processPhoneBatchFilterPosts(items.slice(i, i + CAMPAIGN_PUSH_BATCH_SIZE));
+      }
+    } else {
+      for (const rawItem of items) {
+        await processOnePhone(rawItem);
+      }
     }
     delete task._items;
   }
@@ -732,7 +873,7 @@ async function executeAddPhonesForTask(task) {
   const dupCount = duplicatePhones.length;
   const dupText = dupCount ? ` · ${dupCount} số đã có` : '';
   if (added || dupCount) {
-    await recordActivity({
+    const activityPayload = {
       type: 'campaign_phone',
       action: 'add',
       userId: task.userId,
@@ -750,6 +891,9 @@ async function executeAddPhonesForTask(task) {
         })),
         alreadyInCampaign: duplicatePhones.slice(0, 80),
       },
+    };
+    setImmediate(() => {
+      recordActivity(activityPayload).catch(() => {});
     });
   }
 
@@ -792,6 +936,7 @@ async function addPhones(req, res) {
 
     const pushAll = Boolean(req.body.all || req.body.pushAll);
     const items = pushAll ? [] : normalizePhoneList(req.body);
+    console.log('items', items);
     if (!pushAll && !items.length) {
       return res.status(400).json({ ok: false, error: 'Thiếu số điện thoại' });
     }

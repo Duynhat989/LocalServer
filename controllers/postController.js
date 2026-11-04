@@ -392,6 +392,11 @@ function phoneKeySqlForAlias(alias) {
   return `COALESCE(NULLIF(TRIM(\`${alias}\`.\`phone\`), ''), '${EMPTY_PHONE_LABEL}')`;
 }
 
+/** Trong HAVING: MySQL không cho TRIM(`post`.`phone`) — phải aggregate. */
+function phoneKeySqlHavingForAlias(alias) {
+  return `COALESCE(NULLIF(TRIM(MAX(\`${alias}\`.\`phone\`)), ''), '${EMPTY_PHONE_LABEL}')`;
+}
+
 function whereForPhoneKeyOnAlias(sequelize, phoneKey, alias = FILTER_JOIN_POST_ALIAS) {
   const key = normalizePhoneKey(phoneKey);
   const expr = phoneKeySqlForAlias(alias);
@@ -1071,20 +1076,32 @@ async function resolveWhereForPhoneCollect(query = {}) {
   }
 }
 
-async function listPhoneGroupsPageFromFilterPosts(
-  Post,
-  filterId,
-  postWhere,
-  limit,
-  offset
-) {
+/** Bài mới nhất theo SĐT trong filter_posts (MySQL: gom scanned_at + id). */
+function latestPostPkPickSql(alias = FILTER_JOIN_POST_ALIAS) {
+  return `SUBSTRING(MAX(CONCAT(LPAD(CAST(\`${alias}\`.\`scanned_at\` AS CHAR), 20, '0'), LPAD(\`${alias}\`.\`id\`, 12, '0'))), 21)`;
+}
+
+function mapFilterPostPhoneGroupRows(rows) {
+  return rows.map((row) => ({
+    phone: normalizePhoneKey(row.phone),
+    postPk: Number(row.postPk) || null,
+    latestScannedAt:
+      row.latestScannedAt != null && row.latestScannedAt !== ''
+        ? Number(row.latestScannedAt)
+        : 0,
+  }));
+}
+
+function filterPostPhoneGroupFindOptions(Post, filterId, postWhere, limit, { offset, cursor } = {}) {
   const { FilterPost } = getModels();
+  const { sequelize } = Post;
   const phoneExpr = phoneKeySqlForAlias(FILTER_JOIN_POST_ALIAS);
 
-  const rows = await FilterPost.findAll({
+  const options = {
     attributes: [
       [literal(phoneExpr), 'phone'],
       [literal('MAX(`post`.`scanned_at`)'), 'latestScannedAt'],
+      [literal(latestPostPkPickSql(FILTER_JOIN_POST_ALIAS)), 'postPk'],
     ],
     where: { filterId },
     include: [
@@ -1097,63 +1114,219 @@ async function listPhoneGroupsPageFromFilterPosts(
       },
     ],
     group: [literal(phoneExpr)],
-    order: [[literal('latestScannedAt'), 'DESC']],
+    order: [
+      [literal('latestScannedAt'), 'DESC'],
+      [literal(phoneExpr), 'ASC'],
+    ],
     limit,
-    offset,
+    raw: true,
+    subQuery: false,
+  };
+
+  if (cursor && cursor.phone != null && Number.isFinite(Number(cursor.latestScannedAt))) {
+    const ms = Number(cursor.latestScannedAt);
+    const ph = sequelize.escape(String(cursor.phone));
+    const phoneHaving = phoneKeySqlHavingForAlias(FILTER_JOIN_POST_ALIAS);
+    options.having = literal(
+      `(MAX(\`post\`.\`scanned_at\`) < ${ms} OR (MAX(\`post\`.\`scanned_at\`) = ${ms} AND ${phoneHaving} > ${ph}))`
+    );
+  } else if (Number.isFinite(offset) && offset > 0) {
+    options.offset = offset;
+  }
+
+  return { FilterPost, options };
+}
+
+async function listPhoneGroupsPageFromFilterPosts(
+  Post,
+  filterId,
+  postWhere,
+  limit,
+  offset
+) {
+  const { FilterPost, options } = filterPostPhoneGroupFindOptions(
+    Post,
+    filterId,
+    postWhere,
+    limit,
+    { offset }
+  );
+  const rows = await FilterPost.findAll(options);
+  return mapFilterPostPhoneGroupRows(rows);
+}
+
+/** Keyset — tránh OFFSET lớn trên GROUP BY (đẩy chiến dịch hàng chục nghìn SĐT). */
+async function listPhoneGroupsFromFilterPostsKeyset(
+  Post,
+  filterId,
+  postWhere,
+  limit,
+  cursor
+) {
+  const { FilterPost, options } = filterPostPhoneGroupFindOptions(
+    Post,
+    filterId,
+    postWhere,
+    limit,
+    { cursor }
+  );
+  const rows = await FilterPost.findAll(options);
+  return mapFilterPostPhoneGroupRows(rows);
+}
+
+/**
+ * Một query / lô SĐT: bài mới nhất trong filter_posts (không quét 1M posts từng số).
+ * @returns {Map<string, import('sequelize').Model>} key = normalizePhone(phoneKey)
+ */
+async function fetchLatestPostsBatchViaFilterPosts(
+  Post,
+  filterId,
+  postWhere,
+  phoneKeys
+) {
+  const { FilterPost } = getModels();
+  const { sequelize } = Post;
+  const keys = [
+    ...new Set(
+      phoneKeys.map((k) => normalizePhoneKey(String(k || '').trim())).filter(Boolean)
+    ),
+  ];
+  const result = new Map();
+  if (!keys.length) return result;
+
+  const phoneExpr = phoneKeySqlForAlias(FILTER_JOIN_POST_ALIAS);
+  const keyConditions = keys.map((k) => whereForPhoneKeyOnAlias(sequelize, k));
+  const includeWhere = andWhere(postWhere, { [Op.or]: keyConditions });
+
+  const rows = await FilterPost.findAll({
+    attributes: [
+      [literal(phoneExpr), 'phone'],
+      [literal(latestPostPkPickSql(FILTER_JOIN_POST_ALIAS)), 'postPk'],
+    ],
+    where: { filterId },
+    include: [
+      {
+        model: Post,
+        as: FILTER_JOIN_POST_ALIAS,
+        attributes: [],
+        required: true,
+        where: includeWhere,
+      },
+    ],
+    group: [literal(phoneExpr)],
     raw: true,
     subQuery: false,
   });
 
-  return rows.map((row) => ({
-    phone: normalizePhoneKey(row.phone),
-  }));
+  const postPks = [
+    ...new Set(
+      rows.map((row) => Number(row.postPk)).filter((id) => Number.isFinite(id) && id > 0)
+    ),
+  ];
+  if (!postPks.length) return result;
+
+  const posts = await Post.findAll({
+    where: { id: { [Op.in]: postPks } },
+    attributes: [...POST_LIST_LITE_ATTRIBUTES, 'postMessage', 'keyword'],
+  });
+  const postByPk = new Map(posts.map((p) => [p.id, p]));
+
+  for (const row of rows) {
+    const pk = Number(row.postPk);
+    const post = postByPk.get(pk);
+    if (!post) continue;
+    const phoneKey = normalizePhoneKey(row.phone);
+    const phone = normalizePhone(phoneKey);
+    if (phone) result.set(phone, post);
+  }
+
+  return result;
 }
 
 /**
  * Đẩy tất cả: danh sách SĐT từ filter_posts (filter_id) → JOIN posts.
  * Nhanh hơn quét cả bảng posts + IN (SELECT post_id …).
  */
-async function forEachCampaignPushPhoneFromFilterPosts(query, onPhone, { onTotalReady } = {}) {
+async function forEachCampaignPushPhoneFromFilterPosts(
+  query,
+  onPhone,
+  { onTotalReady, onPhoneBatch, pushBatchSize = 200 } = {}
+) {
   const savedFilterId = parseFilterId(query);
   if (!savedFilterId) {
-    return forEachCampaignPushPhone(query, onPhone, { onTotalReady });
+    return forEachCampaignPushPhone(query, onPhone, { onTotalReady, onPhoneBatch, pushBatchSize });
   }
 
   const { Post } = getModels();
   const postApplied = await assemblePostWhereForFilterJoin(query, savedFilterId);
   const postWhere = postApplied.where;
-  const distinctTotal = await countDistinctPhonesViaFilterPosts(
-    Post,
-    savedFilterId,
-    postWhere
-  );
-  if (typeof onTotalReady === 'function') {
-    onTotalReady(distinctTotal);
+  const estimatedTotal = Math.max(0, Number(query._pushEstimatedTotal) || 0);
+  const skipUpfrontCount = estimatedTotal > 0 && typeof onPhoneBatch === 'function';
+
+  let distinctTotal = estimatedTotal;
+  if (skipUpfrontCount) {
+    if (typeof onTotalReady === 'function') onTotalReady(estimatedTotal);
+  } else {
+    distinctTotal = await countDistinctPhonesViaFilterPosts(
+      Post,
+      savedFilterId,
+      postWhere
+    );
+    if (typeof onTotalReady === 'function') onTotalReady(distinctTotal);
   }
 
   const seen = new Set();
-  const batchSize = 500;
+  const pageSize = 1000;
+  let pendingBatch = [];
+  let cursor = null;
+  let walked = 0;
 
-  for (let offset = 0; offset < distinctTotal; offset += batchSize) {
-    const groups = await listPhoneGroupsPageFromFilterPosts(
+  const flushBatch = async () => {
+    if (!pendingBatch.length || typeof onPhoneBatch !== 'function') return;
+    const chunk = pendingBatch;
+    pendingBatch = [];
+    await onPhoneBatch(chunk);
+  };
+
+  for (;;) {
+    const groups = await listPhoneGroupsFromFilterPostsKeyset(
       Post,
       savedFilterId,
       postWhere,
-      batchSize,
-      offset
+      pageSize,
+      cursor
     );
     if (!groups.length) break;
+
+    const last = groups[groups.length - 1];
+    cursor = { latestScannedAt: last.latestScannedAt, phone: last.phone };
+
     for (const g of groups) {
       if (g.phone === EMPTY_PHONE_LABEL) continue;
       const phone = normalizePhone(g.phone);
       if (!phone || seen.has(phone)) continue;
       seen.add(phone);
-      await onPhone({ phone });
+      walked += 1;
+      const item = { phone, postPk: g.postPk || null };
+      if (typeof onPhoneBatch === 'function') {
+        pendingBatch.push(item);
+        if (pendingBatch.length >= pushBatchSize) {
+          await flushBatch();
+        }
+      } else {
+        await onPhone(item);
+      }
     }
-    if (groups.length < batchSize) break;
+    if (groups.length < pageSize) break;
   }
 
-  return distinctTotal;
+  await flushBatch();
+
+  if (skipUpfrontCount && typeof onTotalReady === 'function') {
+    onTotalReady(walked);
+  }
+
+  return skipUpfrontCount ? walked : distinctTotal;
 }
 
 /** Duyệt từng SĐT khớp bộ lọc — cập nhật tiến độ theo từng số, không gom hết vào RAM. */
@@ -1192,4 +1365,6 @@ module.exports = {
   deletePostsByGroup,
   forEachCampaignPushPhone,
   forEachCampaignPushPhoneFromFilterPosts,
+  fetchLatestPostsBatchViaFilterPosts,
+  assemblePostWhereForFilterJoin,
 };
